@@ -98,6 +98,8 @@ pub enum AppEvent {
     Probe {
         probe: Option<ProbedInstance>,
         tunnel: Option<TunnelInfo>,
+        /// Cumulative interface counters, for the throughput diff.
+        traffic: Option<(u64, u64)>,
         changed: bool,
     },
     Version(String),
@@ -144,6 +146,15 @@ pub struct App {
     pub test_running: bool,
     pub measured: Option<MeasuredAddress>,
     pub measuring: bool,
+
+    /// Current tunnel throughput (down, up) in bytes/s, and the sample it
+    /// was diffed from.
+    pub traffic_rate: Option<(f64, f64)>,
+    last_traffic: Option<((u64, u64), std::time::Instant)>,
+
+    /// One-shot: attempt to start the service at launch when elevated and
+    /// the service is down (user request 2026-10-05).
+    autostart_tried: bool,
 
     pub logs: LogBuffer,
     pub log_paused: bool,
@@ -212,6 +223,44 @@ impl App {
         }
     }
 
+    /// Diff consecutive interface counter samples into a rate; no tunnel or
+    /// a single sample leaves the rate unset.
+    fn update_traffic(&mut self, sample: Option<(u64, u64)>) {
+        match (sample, self.last_traffic.take()) {
+            (Some(now), Some(((in_b, out_b), at))) => {
+                let dt = at.elapsed().as_secs_f64();
+                if dt >= 1.0 {
+                    let down = now.0.saturating_sub(in_b) as f64 / dt;
+                    let up = now.1.saturating_sub(out_b) as f64 / dt;
+                    self.traffic_rate = Some((down, up));
+                }
+                self.last_traffic = Some((now, std::time::Instant::now()));
+            }
+            (Some(now), None) => {
+                self.last_traffic = Some((now, std::time::Instant::now()));
+            }
+            (None, _) => {
+                self.traffic_rate = None;
+            }
+        }
+    }
+
+    /// Terminal window title: state + current throughput (user request
+    /// 2026-10-05). Pure — unit-tested.
+    pub fn title_text(&self) -> String {
+        let mut title = format!("sing-box: {}", self.service.state.as_str());
+        if let Some((down, up)) = self.traffic_rate
+            && self.service.state == LifecycleState::Running
+        {
+            title.push_str(&format!(
+                " · ↓{} ↑{}",
+                crate::net::traffic::fmt_rate(down),
+                crate::net::traffic::fmt_rate(up)
+            ));
+        }
+        title
+    }
+
     /// Check lookup by target for live updates.
     fn check_mut(&mut self, target: &str) -> Option<&mut crate::service::ConnectivityCheck> {
         self.checks.iter_mut().find(|c| c.target == target)
@@ -256,6 +305,7 @@ impl App {
             AppEvent::Probe {
                 probe,
                 tunnel,
+                traffic,
                 changed,
             } => {
                 let was = self.service.state;
@@ -280,6 +330,19 @@ impl App {
                     }
                 }
                 self.refresh_in_flight = false;
+                // Throughput: diff consecutive interface counters.
+                self.update_traffic(traffic);
+                // Autostart once: elevated + stopped + readable config.
+                if !self.autostart_tried {
+                    self.autostart_tried = true;
+                    if self.elevated
+                        && self.service.state == LifecycleState::Stopped
+                        && self.config.is_some()
+                        && !self.quitting
+                    {
+                        self.start_service(ctx);
+                    }
+                }
                 self.recompute();
             }
             AppEvent::Version(v) => {
@@ -827,10 +890,15 @@ impl Ctx {
             } else {
                 None
             };
+            let traffic = match &tunnel {
+                Some(t) => crate::net::traffic::interface_bytes(&t.name).await,
+                None => None,
+            };
             let _ = tx
                 .send(AppEvent::Probe {
                     probe,
                     tunnel,
+                    traffic,
                     changed: false,
                 })
                 .await;
@@ -985,8 +1053,19 @@ pub async fn run(
     app.validating = true;
     ctx.spawn_version();
 
+    let mut last_title = String::new();
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
+
+        // Window title: state + throughput, written only on change.
+        let title = app.title_text();
+        if title != last_title {
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::SetTitle(title.clone())
+            )?;
+            last_title = title;
+        }
 
         tokio::select! {
             ev = evt_rx.recv() => {
@@ -1150,5 +1229,47 @@ mod tests {
             app.service.health_reason.as_deref(),
             Some("service stopped")
         );
+    }
+
+    /// Window title carries the state and, only while running with a rate,
+    /// the current throughput.
+    #[test]
+    fn title_tracks_state_and_rate() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        assert_eq!(app.title_text(), "sing-box: Stopped");
+
+        app.service.state = LifecycleState::Running;
+        assert_eq!(app.title_text(), "sing-box: Running");
+
+        app.traffic_rate = Some((1_258_291.2, 348_160.0));
+        assert_eq!(app.title_text(), "sing-box: Running · ↓1.2 MB/s ↑340 KB/s");
+
+        // Rate never shows while stopped (stale counters are not traffic).
+        app.service.state = LifecycleState::Stopped;
+        assert_eq!(app.title_text(), "sing-box: Stopped");
+    }
+
+    /// Two samples diff into a rate; one sample does not; losing the tunnel
+    /// clears it.
+    #[test]
+    fn traffic_diffing() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        app.update_traffic(Some((1000, 500)));
+        assert!(app.traffic_rate.is_none(), "first sample only baselines");
+
+        // Simulate an aged sample: rewind the stored timestamp.
+        if let Some((_bytes, at)) = app.last_traffic.as_mut() {
+            *at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        }
+        app.update_traffic(Some((3000, 1500)));
+        if let Some((down, up)) = app.traffic_rate {
+            assert!((down - 1000.0).abs() < 5.0, "down {down}");
+            assert!((up - 500.0).abs() < 5.0, "up {up}");
+        } else {
+            panic!("rate missing after second sample");
+        }
+
+        app.update_traffic(None);
+        assert!(app.traffic_rate.is_none());
     }
 }

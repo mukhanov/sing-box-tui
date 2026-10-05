@@ -3,6 +3,7 @@
 pub mod address;
 pub mod ping;
 pub mod route;
+pub mod traffic;
 
 use crate::config::parse::SingBoxConfig;
 

@@ -146,6 +146,13 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
                 if let Some(mtu) = t.mtu {
                     parts.push(dim(format!(" mtu {mtu}")));
                 }
+                if let Some((down, up)) = app.traffic_rate {
+                    parts.push(Span::raw(format!(
+                        " · ↓{} ↑{}",
+                        crate::net::traffic::fmt_rate(down),
+                        crate::net::traffic::fmt_rate(up)
+                    )));
+                }
                 l3.extend(parts);
             }
             None => l3.push(warn("not found (degraded)")),

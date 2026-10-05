@@ -20,8 +20,13 @@ Launch-time elevation only: the app never prompts for a password. Without
 `sudo` every view keeps working; Start/Stop/Restart report as unavailable and
 privileged fields degrade to "unavailable" with a hint.
 
-**Home resolution**: under `sudo`, the config is resolved against the
-*invoking* user's home (`SUDO_USER` → `dscl`), never root's:
+When launched elevated with the service down, the service **starts
+automatically** (validated first; a failed validation shows the verbatim
+error and leaves the app usable).
+
+The **terminal window title** tracks the service: `sing-box: Running · ↓1.3 MB/s ↑651 KB/s`
+(throughput measured from the tunnel interface counters) or `sing-box: Stopped`.
+
 
 ```
 ~/.config/sing-box/config.json
