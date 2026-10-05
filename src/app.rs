@@ -340,10 +340,10 @@ impl App {
         }
     }
 
-    /// Terminal window title: state + current throughput (user request
-    /// 2026-10-05). Pure — unit-tested.
+    /// Terminal window title: colored state glyph + throughput + exit IP.
+    /// Pure — unit-tested.
     pub fn title_text(&self) -> String {
-        let mut title = format!("sing-box: {}", self.service.state.as_str());
+        let mut title = format!("{} sing-box", self.state_glyph());
         if let Some((down, up)) = self.traffic_rate
             && self.service.state == LifecycleState::Running
         {
@@ -359,6 +359,19 @@ impl App {
             title.push_str(&format!(" · {ip}"));
         }
         title
+    }
+
+    /// One-glyph colored state for the title:
+    /// 🔴 stopped, 🟡 transitioning, 🟢 running+healthy, 🟠 running+degraded.
+    pub fn state_glyph(&self) -> &'static str {
+        match self.service.state {
+            LifecycleState::Stopped => "🔴",
+            LifecycleState::Starting | LifecycleState::Stopping => "🟡",
+            LifecycleState::Running => match self.service.health {
+                crate::service::HealthStatus::Degraded => "🟠",
+                _ => "🟢",
+            },
+        }
     }
     /// Check lookup by target for live updates.
     fn check_mut(&mut self, target: &str) -> Option<&mut crate::service::ConnectivityCheck> {
@@ -1399,17 +1412,32 @@ mod tests {
         let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
         app.service.state = LifecycleState::Running;
         app.traffic_rate = Some((1_258_291.2, 348_160.0));
-        assert_eq!(app.title_text(), "sing-box: Running · ↓1.2 MB/s ↑340 KB/s");
+        assert_eq!(app.title_text(), "🟢 sing-box · ↓1.2 MB/s ↑340 KB/s");
         app.vpn_ip = Some("195.201.136.249".into());
         assert_eq!(
             app.title_text(),
-            "sing-box: Running · ↓1.2 MB/s ↑340 KB/s · 195.201.136.249"
+            "🟢 sing-box · ↓1.2 MB/s ↑340 KB/s · 195.201.136.249"
         );
         // Stopped never shows rates or the (stale) IP.
         app.service.state = LifecycleState::Stopped;
         app.recompute();
-        assert_eq!(app.title_text(), "sing-box: Stopped");
+        assert_eq!(app.title_text(), "🔴 sing-box");
         assert!(app.vpn_ip.is_none(), "stop clears the address");
+    }
+
+    /// Degraded (running, broken tunnel) reads orange; transitioning yellow.
+    #[test]
+    fn state_glyph_reflects_health() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        app.service.state = LifecycleState::Running;
+        app.service.health = crate::service::HealthStatus::Degraded;
+        assert_eq!(app.state_glyph(), "🟠");
+        app.service.health = crate::service::HealthStatus::Healthy;
+        assert_eq!(app.state_glyph(), "🟢");
+        app.service.state = LifecycleState::Starting;
+        assert_eq!(app.state_glyph(), "🟡");
+        app.service.state = LifecycleState::Stopped;
+        assert_eq!(app.state_glyph(), "🔴");
     }
 
     /// A failed echo refresh (broken tunnel) drops the address instead of
@@ -1420,7 +1448,7 @@ mod tests {
         app.vpn_ip = Some("195.201.136.249".into());
         app.apply(AppEvent::PublicIp(None), &mut ctx);
         assert!(app.vpn_ip.is_none());
-        assert_eq!(app.title_text(), "sing-box: Running");
+        assert_eq!(app.title_text(), "🟢 sing-box");
 
         app.apply(AppEvent::PublicIp(Some("178.176.79.178".into())), &mut ctx);
         assert_eq!(app.vpn_ip.as_deref(), Some("178.176.79.178"));
@@ -1431,17 +1459,17 @@ mod tests {
     #[test]
     fn title_tracks_state_and_rate() {
         let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
-        assert_eq!(app.title_text(), "sing-box: Stopped");
+        assert_eq!(app.title_text(), "🔴 sing-box");
 
         app.service.state = LifecycleState::Running;
-        assert_eq!(app.title_text(), "sing-box: Running");
+        assert_eq!(app.title_text(), "🟢 sing-box");
 
         app.traffic_rate = Some((1_258_291.2, 348_160.0));
-        assert_eq!(app.title_text(), "sing-box: Running · ↓1.2 MB/s ↑340 KB/s");
+        assert_eq!(app.title_text(), "🟢 sing-box · ↓1.2 MB/s ↑340 KB/s");
 
         // Rate never shows while stopped (stale counters are not traffic).
         app.service.state = LifecycleState::Stopped;
-        assert_eq!(app.title_text(), "sing-box: Stopped");
+        assert_eq!(app.title_text(), "🔴 sing-box");
     }
 
     /// Two samples diff into a rate; one sample does not; losing the tunnel

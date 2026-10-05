@@ -14,10 +14,11 @@ sudo sing-box-tui -c ~/.config/sing-box/config-ya.json
 
 Launch-time elevation only: the app never prompts for a password. When
 launched elevated with the service down, the service **starts
-automatically** (validated first). The **terminal window title** tracks the
-service, live throughput, and the resulting public IP (ifconfig.me through
-the tunnel, refreshed every 30 s):
-`sing-box: Running · ↓1.3 MB/s ↑651 KB/s · 195.201.136.249` / `sing-box: Stopped`.
+automatically** (validated first). The **terminal window title** shows a
+colored state glyph, live throughput, and the resulting public IP
+(ifconfig.me through the tunnel, refreshed every 30 s):
+`🟢 sing-box · ↓1.3 MB/s ↑651 KB/s · 195.201.136.249` / `🔴 sing-box`.
+🔴 stopped · 🟡 starting/stopping · 🟢 running+healthy · 🟠 running+degraded.
 
 All status is derived from observable state — the `sing-box` process
 (`pgrep`/`ps`), the tunnel interface (`ifconfig`), the read-only config file,
