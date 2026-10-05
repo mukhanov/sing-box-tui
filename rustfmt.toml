@@ -1,0 +1,4 @@
+# rustfmt configuration — default rules (T003).
+max_width = 100
+tab_spaces = 4
+edition = "2024"

@@ -1,0 +1,25 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+*.rlib
+*.profraw
+*.profdata
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & local env
+*.log
+.env
+.env.*
+!.env.example
+
+# Local overrides / scratch
+/scratch/
+*.pid
