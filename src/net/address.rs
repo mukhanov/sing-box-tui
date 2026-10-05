@@ -84,13 +84,18 @@ pub async fn measure(tunnel_name: Option<&str>) -> MeasuredAddress {
 
 /// Fetch the apparent public IP, optionally bound to an interface.
 async fn fetch_ip(interface: Option<&str>) -> Result<String, String> {
+    fetch_ip_from(ECHO_URL, interface).await
+}
+
+/// Fetch the public IP from one echo service.
+async fn fetch_ip_from(url: &str, interface: Option<&str>) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("/usr/bin/curl");
     cmd.args(["-s", "--max-time", "5"]);
     if let Some(iface) = interface {
         cmd.args(["--interface", iface]);
     }
     let output = cmd
-        .arg(ECHO_URL)
+        .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -100,13 +105,24 @@ async fn fetch_ip(interface: Option<&str>) -> Result<String, String> {
         .map_err(|e| format!("curl failed to start: {e}"))?;
 
     let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if output.status.success() && !ip.is_empty() && ip.contains('.') || ip.contains(':') {
+    if output.status.success() && (ip.contains('.') || ip.contains(':')) {
         // Sanity: an echo response looks like an address, not an error page.
         if ip.len() <= 45 && !ip.contains(' ') {
             return Ok(ip);
         }
     }
-    Err(format!("no reply from {ECHO_URL}"))
+    Err(format!("no reply from {url}"))
+}
+
+/// The resulting public IP as seen through the given interface — for the
+/// window title. ifconfig.me first (user's pick), ipify as fallback.
+pub async fn public_ip(interface: Option<&str>) -> Option<String> {
+    for url in ["https://ifconfig.me", "https://api.ipify.org"] {
+        if let Ok(ip) = fetch_ip_from(url, interface).await {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 /// The default outbound physical interface (`route -n get default`).

@@ -108,6 +108,8 @@ pub enum AppEvent {
         changed: bool,
     },
     Version(String),
+    /// Resulting public IP through the tunnel (for the window title).
+    PublicIp(Option<String>),
     StartDone(Result<process::StartedService, process::StartError>),
     /// Ok on clean stop; Err carries the reason. `pid` names the survivor on
     /// failure so the final screen can state it (FR-020).
@@ -139,8 +141,10 @@ pub struct App {
     /// Read/parse error, naming the path tried (spec Edge Cases).
     pub config_error: Option<String>,
     pub config_changed: bool,
-    /// Config files selectable in the Config panel (`[` / `]`).
+    /// Config files selectable in the Config panel (`[` / `]` select, Enter apply).
     pub profiles: Vec<PathBuf>,
+    /// Selection cursor into `profiles`.
+    pub profile_cursor: usize,
     pub credentials_visible: bool,
     pub validation: Option<ValidationResult>,
     pub validating: bool,
@@ -158,6 +162,9 @@ pub struct App {
     /// was diffed from.
     pub traffic_rate: Option<(f64, f64)>,
     last_traffic: Option<((u64, u64), std::time::Instant)>,
+    /// Resulting public IP through the tunnel, for the window title.
+    pub vpn_ip: Option<String>,
+    ip_fetch_at: Option<std::time::Instant>,
 
     /// One-shot: attempt to start the service at launch when elevated and
     /// the service is down (user request 2026-10-05).
@@ -223,7 +230,8 @@ impl App {
         }
     }
 
-    /// Rescan the profile directory (json files next to the current config).
+    /// Rescan the profile directory (json files next to the current config)
+    /// and park the selection cursor on the active profile.
     pub fn rescan_profiles(&mut self) {
         let Some(dir) = self.config_path.as_ref().and_then(|p| p.parent()) else {
             return;
@@ -235,27 +243,40 @@ impl App {
         {
             self.profiles.push(cur.clone());
         }
-    }
-
-    /// Switch to the previous (`[`)/next (`]`) profile: reload the view and,
-    /// when the service runs, offer a restart to apply it.
-    pub fn switch_profile(&mut self, ctx: &mut Ctx, forward: bool) {
-        if self.profiles.len() < 2 {
-            self.note("no other profiles found next to the config");
-            return;
-        }
-        let current = self
+        self.profile_cursor = self
             .profiles
             .iter()
             .position(|p| Some(p) == self.config_path.as_ref())
             .unwrap_or(0);
+    }
+
+    /// Move the profile selection cursor (`[` previous, `]` next). Selection
+    /// only; Enter applies it.
+    pub fn select_profile_step(&mut self, forward: bool) {
+        if self.profiles.len() < 2 {
+            self.note("no other profiles found next to the config");
+            return;
+        }
         let len = self.profiles.len();
-        let next = if forward {
-            (current + 1) % len
+        self.profile_cursor = if forward {
+            (self.profile_cursor + 1) % len
         } else {
-            (current + len - 1) % len
+            (self.profile_cursor + len - 1) % len
         };
-        let path = self.profiles[next].clone();
+    }
+
+    /// Apply the selected profile (Enter): reload the view and, when the
+    /// service runs, offer a restart to apply it for real.
+    pub fn apply_selected_profile(&mut self, ctx: &mut Ctx) {
+        if self.profiles.is_empty() {
+            return;
+        }
+        let cursor = self.profile_cursor.min(self.profiles.len() - 1);
+        let path = self.profiles[cursor].clone();
+        if Some(&path) == self.config_path.as_ref() {
+            self.note("selected profile is already active");
+            return;
+        }
         self.config_path = Some(path);
         self.scroll_config = 0;
         self.load_config();
@@ -326,9 +347,13 @@ impl App {
                 crate::net::traffic::fmt_rate(up)
             ));
         }
+        if let Some(ip) = &self.vpn_ip
+            && self.service.state == LifecycleState::Running
+        {
+            title.push_str(&format!(" · {ip}"));
+        }
         title
     }
-
     /// Check lookup by target for live updates.
     fn check_mut(&mut self, target: &str) -> Option<&mut crate::service::ConnectivityCheck> {
         self.checks.iter_mut().find(|c| c.target == target)
@@ -416,6 +441,12 @@ impl App {
             AppEvent::Version(v) => {
                 self.version = Some(v);
                 self.service.version = self.version.clone();
+            }
+            AppEvent::PublicIp(ip) => {
+                // Keep the last known address on a failed refresh.
+                if ip.is_some() {
+                    self.vpn_ip = ip;
+                }
             }
             AppEvent::StartDone(Ok(started)) => {
                 let pid = started.pid;
@@ -807,8 +838,9 @@ impl App {
                 }
             }
             (KeyCode::Char('p'), _) => self.log_paused = !self.log_paused,
-            (KeyCode::Char(']'), _) => self.switch_profile(ctx, true),
-            (KeyCode::Char('['), _) => self.switch_profile(ctx, false),
+            (KeyCode::Char(']'), _) => self.select_profile_step(true),
+            (KeyCode::Char('['), _) => self.select_profile_step(false),
+            (KeyCode::Enter, _) => self.apply_selected_profile(ctx),
             _ => {}
         }
     }
@@ -1098,6 +1130,14 @@ impl Ctx {
             }
         });
     }
+
+    fn spawn_public_ip(&self, tunnel: Option<String>) {
+        let tx = self.evt_tx.clone();
+        tokio::spawn(async move {
+            let ip = crate::net::address::public_ip(tunnel.as_deref()).await;
+            let _ = tx.send(AppEvent::PublicIp(ip)).await;
+        });
+    }
 }
 
 /// Stream a child's pipe into LogLine events.
@@ -1192,6 +1232,20 @@ pub async fn run(
                 if app.version.is_none() {
                     ctx.spawn_version();
                 }
+                // Resulting public IP for the title: refresh every 30 s
+                // while the tunnel is up (an echo request per tick would be
+                // chatty).
+                const IP_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+                let ip_due = app
+                    .ip_fetch_at
+                    .is_none_or(|at| at.elapsed() >= IP_REFRESH);
+                if ip_due
+                    && app.service.state == LifecycleState::Running
+                    && let Some(tunnel) = app.service.tunnel.as_ref().map(|t| t.name.clone())
+                {
+                    app.ip_fetch_at = Some(std::time::Instant::now());
+                    ctx.spawn_public_ip(Some(tunnel));
+                }
                 // Config change detection (FR-016).
                 if let Some(path) = &app.config_path
                     && app.config_error.is_none()
@@ -1220,6 +1274,262 @@ mod tests {
     use super::*;
     use crate::service::LifecycleState;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        }
+    }
+
+    fn app_external_running() -> (App, Ctx) {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::new(false, PathBuf::from("/tmp/config.json"));
+        app.service.state = LifecycleState::Running;
+        app.service.pid = Some(4242);
+        app.service.owned_by_app = false;
+        (app, Ctx::new(tx, PathBuf::from("/bin/true")))
+    }
+
+    /// Declining the quit dialog leaves the external instance running and the
+    /// final screen states it (FR-019b, T039).
+    #[tokio::test]
+    async fn quit_external_declined_leaves_running() {
+        let (mut app, mut ctx) = app_external_running();
+        app.on_key(key(KeyCode::Char('q')), &mut ctx);
+        assert_eq!(app.dialog, Some(Dialog::QuitExternal { pid: 4242 }));
+        app.on_key(key(KeyCode::Char('n')), &mut ctx);
+        assert_eq!(
+            app.quit_outcome.as_deref(),
+            Some("service left running (pid 4242)")
+        );
+    }
+
+    /// Only y/n/Esc affect an open dialog; other keys are ignored.
+    #[tokio::test]
+    async fn dialog_ignores_other_keys() {
+        let (mut app, mut ctx) = app_external_running();
+        app.on_key(key(KeyCode::Char('q')), &mut ctx);
+        app.on_key(key(KeyCode::Char('x')), &mut ctx);
+        assert_eq!(app.dialog, Some(Dialog::QuitExternal { pid: 4242 }));
+    }
+
+    /// While the target input is open, all other keys route to the input —
+    /// no panel actions, no quit (contracts/ui.md, T022).
+    #[tokio::test]
+    async fn target_input_captures_all_keys() {
+        let (mut app, mut ctx) = app_external_running();
+        app.on_key(key(KeyCode::Char('t')), &mut ctx);
+        assert!(app.input.is_some());
+        for c in ['q', 'x', 's', 'c'] {
+            app.on_key(key(KeyCode::Char(c)), &mut ctx);
+        }
+        assert_eq!(app.input.as_ref().unwrap().buffer, "qxsc");
+        assert_eq!(
+            app.service.state,
+            LifecycleState::Running,
+            "no action taken"
+        );
+        app.on_key(key(KeyCode::Enter), &mut ctx);
+        assert!(app.input.is_none());
+        assert_eq!(app.custom_targets, vec!["qxsc".to_string()]);
+    }
+
+    /// Unprivileged start is gated with a message naming the needed action
+    /// and never starts anything (FR-020a, SC-013).
+    #[tokio::test]
+    async fn unprivileged_start_gated() {
+        let (mut app, mut ctx) = app_external_running();
+        app.service.state = LifecycleState::Stopped;
+        app.service.pid = None;
+        app.on_key(key(KeyCode::Char('s')), &mut ctx);
+        assert!(
+            app.action_error
+                .as_deref()
+                .unwrap()
+                .contains("sudo sing-box-tui")
+        );
+        assert_eq!(app.service.state, LifecycleState::Stopped);
+        assert!(!app.starting);
+    }
+
+    /// Quit with no service exits silently with an empty outcome.
+    #[tokio::test]
+    async fn quit_without_service_is_silent() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        let mut ctx = Ctx::new(tx, PathBuf::from("/bin/true"));
+        app.on_key(key(KeyCode::Char('q')), &mut ctx);
+        assert_eq!(app.quit_outcome.as_deref(), Some(""));
+        assert!(!app.quitting);
+    }
+
+    /// Stopped presentation: health is Down and the reason names it; ping
+    /// results read as not measured while stopped (T017).
+    #[test]
+    fn stopped_presentation() {
+        let mut app = App::new(false, PathBuf::from("/tmp/config.json"));
+        app.checks.push(crate::service::ConnectivityCheck {
+            target: "example.com".into(),
+            status: crate::service::CheckStatus::Complete,
+            sent: 4,
+            received: 4,
+            loss: 0.0,
+            ..Default::default()
+        });
+        app.recompute();
+        assert_eq!(app.service.health, crate::service::HealthStatus::Down);
+        assert_eq!(
+            app.service.health_reason.as_deref(),
+            Some("service stopped")
+        );
+    }
+
+    /// The title ends with the resulting public IP while running.
+    #[test]
+    fn title_includes_vpn_ip() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        app.service.state = LifecycleState::Running;
+        app.traffic_rate = Some((1_258_291.2, 348_160.0));
+        assert_eq!(app.title_text(), "sing-box: Running · ↓1.2 MB/s ↑340 KB/s");
+        app.vpn_ip = Some("195.201.136.249".into());
+        assert_eq!(
+            app.title_text(),
+            "sing-box: Running · ↓1.2 MB/s ↑340 KB/s · 195.201.136.249"
+        );
+        // Stopped never shows rates or the (stale) IP.
+        app.service.state = LifecycleState::Stopped;
+        assert_eq!(app.title_text(), "sing-box: Stopped");
+    }
+
+    /// Window title carries the state and, only while running with a rate,
+    /// the current throughput.
+    #[test]
+    fn title_tracks_state_and_rate() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        assert_eq!(app.title_text(), "sing-box: Stopped");
+
+        app.service.state = LifecycleState::Running;
+        assert_eq!(app.title_text(), "sing-box: Running");
+
+        app.traffic_rate = Some((1_258_291.2, 348_160.0));
+        assert_eq!(app.title_text(), "sing-box: Running · ↓1.2 MB/s ↑340 KB/s");
+
+        // Rate never shows while stopped (stale counters are not traffic).
+        app.service.state = LifecycleState::Stopped;
+        assert_eq!(app.title_text(), "sing-box: Stopped");
+    }
+
+    /// Two samples diff into a rate; one sample does not; losing the tunnel
+    /// clears it.
+    #[test]
+    fn traffic_diffing() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        app.update_traffic(Some((1000, 500)));
+        assert!(app.traffic_rate.is_none(), "first sample only baselines");
+
+        // Simulate an aged sample: rewind the stored timestamp.
+        if let Some((_bytes, at)) = app.last_traffic.as_mut() {
+            *at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        }
+        app.update_traffic(Some((3000, 1500)));
+        if let Some((down, up)) = app.traffic_rate {
+            assert!((down - 1000.0).abs() < 5.0, "down {down}");
+            assert!((up - 500.0).abs() < 5.0, "up {up}");
+        } else {
+            panic!("rate missing after second sample");
+        }
+
+        app.update_traffic(None);
+        assert!(app.traffic_rate.is_none());
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sb-tui-profile-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scan_lists_sorted_json_only() {
+        let dir = temp_dir("scan");
+        fs::write(dir.join("config-ya.json"), "{}").unwrap();
+        fs::write(dir.join("config.json"), "{}").unwrap();
+        fs::write(dir.join("config.json.bak"), "{}").unwrap();
+        fs::write(dir.join("notes.txt"), "x").unwrap();
+        fs::write(dir.join(".hidden.json"), "{}").unwrap();
+
+        let names: Vec<String> = scan_profiles(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["config-ya.json", "config.json"],
+            "sorted, no bak/txt/hidden"
+        );
+        assert!(scan_profiles(&dir.join("missing")).is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Selecting with [ / ] only moves the cursor; Enter applies the
+    /// selection, reloads the config, and asks about a restart when the
+    /// service runs.
+    #[tokio::test]
+    async fn profile_select_then_enter_applies() {
+        let dir = temp_dir("switch");
+        std::fs::write(dir.join("a.json"), r#"{"route":{"final":"direct"}}"#).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"route":{"final":"proxy"}}"#).unwrap();
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::new(true, dir.join("a.json"));
+        let mut ctx = Ctx::new(tx, PathBuf::from("/bin/true"));
+        app.load_config();
+        assert_eq!(app.profiles.len(), 2);
+        assert_eq!(app.profile_cursor, 0, "cursor starts on the active profile");
+
+        // Selection moves the cursor only — nothing reloads.
+        app.on_key(key(KeyCode::Char(']')), &mut ctx);
+        assert_eq!(app.profile_cursor, 1, "moved onto b.json");
+        assert_eq!(app.config_path, Some(dir.join("a.json")), "no switch yet");
+
+        // Enter applies (service stopped → silent switch).
+        app.on_key(key(KeyCode::Enter), &mut ctx);
+        assert_eq!(app.config_path, Some(dir.join("b.json")));
+        assert_eq!(app.config.as_ref().unwrap().route.final_, "proxy");
+        assert!(app.dialog.is_none());
+
+        // Running service: applying a different profile asks about restart.
+        app.service.state = LifecycleState::Running;
+        app.service.pid = Some(999);
+        app.on_key(key(KeyCode::Char('[')), &mut ctx);
+        app.on_key(key(KeyCode::Enter), &mut ctx);
+        assert!(matches!(app.dialog, Some(Dialog::SwitchProfile { .. })));
+        // Decline keeps the switch view-only.
+        app.on_key(key(KeyCode::Char('n')), &mut ctx);
+        assert_eq!(app.config_path, Some(dir.join("a.json")));
+        assert!(app.dialog.is_none());
+        assert_eq!(
+            app.service.state,
+            LifecycleState::Running,
+            "decline never stops anything"
+        );
+
+        // Enter on the already-active profile is a no-op.
+        app.on_key(key(KeyCode::Enter), &mut ctx);
+        assert_eq!(app.config_path, Some(dir.join("a.json")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -1373,92 +1683,5 @@ mod tests {
 
         app.update_traffic(None);
         assert!(app.traffic_rate.is_none());
-    }
-}
-
-#[cfg(test)]
-mod profile_tests {
-    use super::*;
-    use std::fs;
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sb-tui-profile-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn scan_lists_sorted_json_only() {
-        let dir = temp_dir("scan");
-        fs::write(dir.join("config-ya.json"), "{}").unwrap();
-        fs::write(dir.join("config.json"), "{}").unwrap();
-        fs::write(dir.join("config.json.bak"), "{}").unwrap();
-        fs::write(dir.join("notes.txt"), "x").unwrap();
-        fs::write(dir.join(".hidden.json"), "{}").unwrap();
-
-        let names: Vec<String> = scan_profiles(&dir)
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(
-            names,
-            vec!["config-ya.json", "config.json"],
-            "sorted, no bak/txt/hidden"
-        );
-        assert!(scan_profiles(&dir.join("missing")).is_empty());
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Switching cycles profiles, reloads the config, and asks about a
-    /// restart when the service runs.
-    #[tokio::test]
-    async fn switch_profile_cycles_and_asks_when_running() {
-        let dir = temp_dir("switch");
-        fs::write(dir.join("a.json"), r#"{"route":{"final":"direct"}}"#).unwrap();
-        fs::write(dir.join("b.json"), r#"{"route":{"final":"proxy"}}"#).unwrap();
-
-        let (tx, _rx) = mpsc::channel(8);
-        let mut app = App::new(true, dir.join("a.json"));
-        let mut ctx = Ctx::new(tx, PathBuf::from("/bin/true"));
-        app.load_config();
-        assert_eq!(app.profiles.len(), 2);
-        assert_eq!(app.config.as_ref().unwrap().route.final_, "direct");
-
-        // Service stopped: switch silently moves the view.
-        app.switch_profile(&mut ctx, true);
-        assert_eq!(app.config_path, Some(dir.join("b.json")));
-        assert_eq!(app.config.as_ref().unwrap().route.final_, "proxy");
-        assert!(app.dialog.is_none());
-
-        // Wrap-around backwards.
-        app.switch_profile(&mut ctx, false);
-        assert_eq!(app.config_path, Some(dir.join("a.json")));
-
-        // Running service: switching offers a restart.
-        app.service.state = LifecycleState::Running;
-        app.service.pid = Some(999);
-        app.switch_profile(&mut ctx, true);
-        assert!(matches!(app.dialog, Some(Dialog::SwitchProfile { .. })));
-        // Decline keeps the switch view-only.
-        app.on_key(key(KeyCode::Char('n')), &mut ctx);
-        assert_eq!(app.config_path, Some(dir.join("b.json")));
-        assert!(app.dialog.is_none());
-        assert_eq!(
-            app.service.state,
-            LifecycleState::Running,
-            "decline never stops anything"
-        );
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::empty(),
-        }
     }
 }

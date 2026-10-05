@@ -73,9 +73,46 @@ impl LogBuffer {
 
 const LEVELS: [&str; 7] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "PANIC"];
 
+/// Remove ANSI escape sequences (CSI: `\x1b[…m` and friends). sing-box
+/// colorizes levels even when piped (`\x1b[36mINFO\x1b[0m`); the codes must
+/// not reach the parser or the screen (pure; tested).
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.next() {
+                Some('[') => {
+                    // CSI: consume until a final byte (0x40..=0x7E).
+                    for c2 in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: consume until BEL or ST (ESC \).
+                    loop {
+                        match chars.next() {
+                            Some('\u{7}') | None => break,
+                            // ST is ESC \ — consume the backslash and stop.
+                            Some('\x1b') if chars.next() == Some('\\') => break,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse one raw output line into a LogEntry (pure).
 ///
-/// Formats handled:
+/// Formats handled (after ANSI stripping):
 /// - timestamped console (sing-box with `log.timestamp: true`):
 ///   `+0300 2026-10-05 19:57:45 INFO inbound/tun: accepted connection …`
 /// - plain console: `INFO[0000] message` / `WARN message`
@@ -83,7 +120,8 @@ const LEVELS: [&str; 7] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "
 ///
 /// Anything else keeps the whole line with an unknown level (`-`).
 pub fn parse_line(raw: &str) -> LogEntry {
-    let line = raw.trim_end_matches('\r');
+    let stripped = strip_ansi(raw);
+    let line = stripped.trim_end_matches('\r').trim_end();
     let timestamp = SystemTime::now();
 
     // JSON format: {"level":"info","message":"...","timestamp":"..."}
@@ -234,5 +272,45 @@ mod tests {
         assert_eq!(buf.total_dropped, 2);
         let tail: Vec<String> = buf.tail(10).iter().map(|e| e.message.clone()).collect();
         assert_eq!(tail, vec!["m2", "m3", "m4"]);
+    }
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use super::*;
+
+    /// Real bytes from sing-box 1.14.1 piped output: levels carry ANSI
+    /// color codes even on a pipe. The parser must see through them and the
+    /// codes must never reach the message.
+    #[test]
+    fn parses_real_colored_bytes() {
+        let e = parse_line(
+            "+0300 2026-10-05 20:15:44 \u{1b}[36mINFO\u{1b}[0m network: updated default interface en0, index 15",
+        );
+        assert_eq!(e.level, "info");
+        assert_eq!(e.time.as_deref(), Some("20:15:44"));
+        assert_eq!(
+            e.message,
+            "network: updated default interface en0, index 15"
+        );
+        assert!(!e.message.contains('\u{1b}'));
+
+        let e = parse_line(
+            "\u{1b}[33mWARN\u{1b}[0m[0000] `independent_cache` DNS option is deprecated",
+        );
+        assert_eq!(e.level, "warn");
+        assert_eq!(e.message, "`independent_cache` DNS option is deprecated");
+
+        let e = parse_line("\u{1b}[31mFATAL\u{1b}[0m[0000] start service: operation not permitted");
+        assert_eq!(e.level, "fatal");
+        assert_eq!(e.message, "start service: operation not permitted");
+    }
+
+    #[test]
+    fn strips_csi_and_osc() {
+        assert_eq!(strip_ansi("\u{1b}[36mINFO\u{1b}[0m rest"), "INFO rest");
+        assert_eq!(strip_ansi("\u{1b}[1;31mX\u{1b}[0m"), "X");
+        assert_eq!(strip_ansi("no codes"), "no codes");
+        assert_eq!(strip_ansi("osc\u{1b}]0;title\u{7}tail"), "osctail");
     }
 }

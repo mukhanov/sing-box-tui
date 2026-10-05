@@ -12,6 +12,12 @@ sudo sing-box-tui                          # default config, autostart
 sudo sing-box-tui -c ~/.config/sing-box/config-ya.json
 ```
 
+Launch-time elevation only: the app never prompts for a password. When
+launched elevated with the service down, the service **starts
+automatically** (validated first). The **terminal window title** tracks the
+service, live throughput, and the resulting public IP (ifconfig.me through
+the tunnel, refreshed every 30 s):
+`sing-box: Running · ↓1.3 MB/s ↑651 KB/s · 195.201.136.249` / `sing-box: Stopped`.
 
 All status is derived from observable state — the `sing-box` process
 (`pgrep`/`ps`), the tunnel interface (`ifconfig`), the read-only config file,
@@ -60,7 +66,7 @@ credentials). See `sing-box-tui --help` for all flags.
 | `v` | Toggle credential visibility (Config panel) |
 | `l` | Reload config after a change is detected |
 | `p` | Pause log output |
-| `[` / `]` | Previous / next config profile (asks to restart the service) |
+| `[` / `]` then `Enter` | Move the profile selection cursor; `Enter` applies it (asks to restart the running service) |
 
 While the target input is open, all other keys route to the input.
 Confirmation dialogs accept `y` / `n` / `Esc` only.

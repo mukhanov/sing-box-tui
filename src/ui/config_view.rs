@@ -85,23 +85,24 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
         ]));
     }
 
-    // Profiles: switchable configs from the same directory ([ / ]).
+    // Profiles: selectable configs from the same directory
+    // ([ / ] move the cursor, Enter applies).
     if app.profiles.len() > 1 {
-        lines.push(Line::from(dim("profiles ([ / ] switch):".to_string())));
-        for p in &app.profiles {
+        lines.push(Line::from(dim("profiles ([ / ] select, ⏎ apply):")));
+        for (i, p) in app.profiles.iter().enumerate() {
             let name = p
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| p.to_string_lossy().to_string());
             let active = Some(p) == app.config_path.as_ref();
-            let marker = if active { "● " } else { "  " };
-            let span = if active {
-                Span::styled(
-                    format!("{marker}{name}"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )
+            let selected = i == app.profile_cursor;
+            let cursor = if selected { "▸ " } else { "  " };
+            let suffix = if active { " ●" } else { "" };
+            let text = format!("{cursor}{name}{suffix}");
+            let span = if active || selected {
+                Span::styled(text, Style::default().add_modifier(Modifier::BOLD))
             } else {
-                dim(format!("{marker}{name}"))
+                dim(text)
             };
             lines.push(Line::from(span));
         }
