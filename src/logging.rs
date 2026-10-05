@@ -9,6 +9,8 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
     pub timestamp: SystemTime,
+    /// `HH:MM:SS` parsed from the line when sing-box prints timestamps.
+    pub time: Option<String>,
     pub level: String,
     pub message: String,
 }
@@ -18,7 +20,7 @@ pub struct LogEntry {
 pub struct LogBuffer {
     entries: VecDeque<LogEntry>,
     cap: usize,
-    /// Set when the output stream ended (process exited) — pause UI churn.
+    /// Lines evicted by the ring (diagnostic counter).
     pub total_dropped: u64,
 }
 
@@ -69,12 +71,17 @@ impl LogBuffer {
     }
 }
 
+const LEVELS: [&str; 7] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "PANIC"];
+
 /// Parse one raw output line into a LogEntry (pure).
 ///
-/// sing-box console output looks like `INFO[0000] start initial services`
-/// (level token, optional bracketed counter, message). JSON-formatted log
-/// lines carry `level`/`message` fields. Anything else keeps the whole line
-/// with an unknown level (`-`).
+/// Formats handled:
+/// - timestamped console (sing-box with `log.timestamp: true`):
+///   `+0300 2026-10-05 19:57:45 INFO inbound/tun: accepted connection …`
+/// - plain console: `INFO[0000] message` / `WARN message`
+/// - JSON: `{"level":"info","message":"…"}`
+///
+/// Anything else keeps the whole line with an unknown level (`-`).
 pub fn parse_line(raw: &str) -> LogEntry {
     let line = raw.trim_end_matches('\r');
     let timestamp = SystemTime::now();
@@ -96,16 +103,37 @@ pub fn parse_line(raw: &str) -> LogEntry {
             .to_string();
         return LogEntry {
             timestamp,
+            time: None,
             level,
             message,
         };
     }
 
-    // Console format: `INFO[0000] message` / `WARN message`.
+    // Timestamped console format: `+0300 2026-10-05 19:57:45 LEVEL message`.
+    // The timestamp prefix (~29 chars) must not eat the message — the
+    // interesting part (connection addresses) follows the level.
+    let tokens: Vec<&str> = line.splitn(5, ' ').filter(|t| !t.is_empty()).collect();
+    if tokens.len() >= 4 && is_tz_offset(tokens[0]) {
+        let level_token = tokens[3];
+        let level = level_token
+            .trim_end_matches(|c: char| c == '[' || c == ']' || c.is_ascii_digit())
+            .to_ascii_uppercase();
+        if LEVELS.contains(&level.as_str()) {
+            return LogEntry {
+                timestamp,
+                time: Some(tokens[2].to_string()),
+                level: level.to_ascii_lowercase(),
+                message: tokens.get(4).unwrap_or(&"").trim().to_string(),
+            };
+        }
+    }
+
+    // Plain console format: `INFO[0000] message` / `WARN message`.
     let first: &str = line.split_whitespace().next().unwrap_or("");
-    let known = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "PANIC"];
-    let upper = first.trim_end_matches(|c: char| c == '[' || c == ']' || c.is_ascii_digit());
-    if known.contains(&upper) && line.len() >= first.len() {
+    let upper = first
+        .trim_end_matches(|c: char| c == '[' || c == ']' || c.is_ascii_digit())
+        .to_ascii_uppercase();
+    if LEVELS.contains(&upper.as_str()) && line.len() >= first.len() {
         // Strip the level token (and any bracketed counter) from the message.
         let rest = &line[first.len()..];
         let rest = rest
@@ -113,6 +141,7 @@ pub fn parse_line(raw: &str) -> LogEntry {
             .unwrap_or(rest);
         return LogEntry {
             timestamp,
+            time: None,
             level: upper.to_ascii_lowercase(),
             message: rest.trim().to_string(),
         };
@@ -120,9 +149,18 @@ pub fn parse_line(raw: &str) -> LogEntry {
 
     LogEntry {
         timestamp,
+        time: None,
         level: "-".to_string(),
         message: line.to_string(),
     }
+}
+
+/// `+0300` / `-0530` timezone-offset token.
+fn is_tz_offset(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() == 5
+        && (bytes[0] == b'+' || bytes[0] == b'-')
+        && bytes[1..].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -142,6 +180,27 @@ mod tests {
         let e = parse_line("WARN[0012] deprecated option");
         assert_eq!(e.level, "warn");
         assert_eq!(e.message, "deprecated option");
+    }
+
+    /// The real sing-box format with `log.timestamp: true` — the format the
+    /// user's service emits. The connection address must survive in the
+    /// message, not be truncated away with the timestamp.
+    #[test]
+    fn parses_timestamped_format() {
+        let e = parse_line(
+            "+0300 2026-10-05 19:57:45 INFO inbound/tun[tun-in]: accepted connection to tcp:ya.ru:443",
+        );
+        assert_eq!(e.level, "info");
+        assert_eq!(e.time.as_deref(), Some("19:57:45"));
+        assert_eq!(
+            e.message,
+            "inbound/tun[tun-in]: accepted connection to tcp:ya.ru:443"
+        );
+
+        let e = parse_line("+0000 2026-10-05 10:00:00 WARN some warning detail");
+        assert_eq!(e.level, "warn");
+        assert_eq!(e.time.as_deref(), Some("10:00:00"));
+        assert_eq!(e.message, "some warning detail");
     }
 
     #[test]
@@ -166,6 +225,7 @@ mod tests {
         for i in 0..5 {
             buf.push(LogEntry {
                 timestamp: SystemTime::now(),
+                time: None,
                 level: "info".into(),
                 message: format!("m{i}"),
             });

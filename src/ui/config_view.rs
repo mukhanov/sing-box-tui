@@ -84,6 +84,28 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
             Span::raw(p.to_string_lossy().to_string()),
         ]));
     }
+
+    // Profiles: switchable configs from the same directory ([ / ]).
+    if app.profiles.len() > 1 {
+        lines.push(Line::from(dim("profiles ([ / ] switch):".to_string())));
+        for p in &app.profiles {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string_lossy().to_string());
+            let active = Some(p) == app.config_path.as_ref();
+            let marker = if active { "● " } else { "  " };
+            let span = if active {
+                Span::styled(
+                    format!("{marker}{name}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )
+            } else {
+                dim(format!("{marker}{name}"))
+            };
+            lines.push(Line::from(span));
+        }
+    }
     let validation = match (&app.validation, app.validating) {
         (_, true) => dim("  validation: checking…".to_string()),
         (Some(v), _) => {

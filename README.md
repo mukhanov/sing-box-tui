@@ -60,6 +60,7 @@ credentials). See `sing-box-tui --help` for all flags.
 | `v` | Toggle credential visibility (Config panel) |
 | `l` | Reload config after a change is detected |
 | `p` | Pause log output |
+| `[` / `]` | Previous / next config profile (asks to restart the service) |
 
 While the target input is open, all other keys route to the input.
 Confirmation dialogs accept `y` / `n` / `Esc` only.

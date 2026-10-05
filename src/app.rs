@@ -72,6 +72,8 @@ pub enum Dialog {
     QuitExternal { pid: u32 },
     /// Reload a config that changed on disk (FR-016).
     ReloadConfig,
+    /// A profile was selected while the service runs: restart applies it.
+    SwitchProfile { name: String, pid: Option<u32> },
 }
 
 impl Dialog {
@@ -89,6 +91,9 @@ impl Dialog {
                 format!("sing-box (pid {pid}) was not started by this app.\nStop it on quit?")
             }
             Dialog::ReloadConfig => "config.json changed on disk.\nReload it?".to_string(),
+            Dialog::SwitchProfile { name, .. } => {
+                format!("service is running.\nRestart it with {name}?")
+            }
         }
     }
 }
@@ -134,6 +139,8 @@ pub struct App {
     /// Read/parse error, naming the path tried (spec Edge Cases).
     pub config_error: Option<String>,
     pub config_changed: bool,
+    /// Config files selectable in the Config panel (`[` / `]`).
+    pub profiles: Vec<PathBuf>,
     pub credentials_visible: bool,
     pub validation: Option<ValidationResult>,
     pub validating: bool,
@@ -183,12 +190,14 @@ pub struct App {
 
 impl App {
     pub fn new(elevated: bool, config_path: PathBuf) -> Self {
-        App {
+        let mut app = App {
             elevated,
             config_path: Some(config_path),
             focused: Panel::Status,
             ..App::default()
-        }
+        };
+        app.rescan_profiles();
+        app
     }
 
     /// Load (or reload) the config; errors are recorded, never fatal (T032).
@@ -212,6 +221,65 @@ impl App {
                 self.config_error = Some(format!("{}: {e}", path.display()));
             }
         }
+    }
+
+    /// Rescan the profile directory (json files next to the current config).
+    pub fn rescan_profiles(&mut self) {
+        let Some(dir) = self.config_path.as_ref().and_then(|p| p.parent()) else {
+            return;
+        };
+        self.profiles = scan_profiles(dir);
+        // The current file always stays selectable even if the scan misses it.
+        if let Some(cur) = &self.config_path
+            && !self.profiles.contains(cur)
+        {
+            self.profiles.push(cur.clone());
+        }
+    }
+
+    /// Switch to the previous (`[`)/next (`]`) profile: reload the view and,
+    /// when the service runs, offer a restart to apply it.
+    pub fn switch_profile(&mut self, ctx: &mut Ctx, forward: bool) {
+        if self.profiles.len() < 2 {
+            self.note("no other profiles found next to the config");
+            return;
+        }
+        let current = self
+            .profiles
+            .iter()
+            .position(|p| Some(p) == self.config_path.as_ref())
+            .unwrap_or(0);
+        let len = self.profiles.len();
+        let next = if forward {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        let path = self.profiles[next].clone();
+        self.config_path = Some(path);
+        self.scroll_config = 0;
+        self.load_config();
+        self.rescan_profiles();
+        ctx.watch.reset();
+        if let Some(p) = self.config_path.clone() {
+            ctx.spawn_validate(p);
+            self.validating = true;
+        }
+        let name = self
+            .config_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if self.service.state == LifecycleState::Running {
+            self.dialog = Some(Dialog::SwitchProfile {
+                name,
+                pid: self.service.pid,
+            });
+        } else {
+            self.note(format!("switched to {name} (service stopped)"));
+        }
+        self.recompute();
     }
 
     pub fn recompute(&mut self) {
@@ -739,6 +807,8 @@ impl App {
                 }
             }
             (KeyCode::Char('p'), _) => self.log_paused = !self.log_paused,
+            (KeyCode::Char(']'), _) => self.switch_profile(ctx, true),
+            (KeyCode::Char('['), _) => self.switch_profile(ctx, false),
             _ => {}
         }
     }
@@ -780,6 +850,19 @@ impl App {
                     self.reload_config_confirmed(ctx);
                 } else {
                     self.note("reload declined");
+                }
+            }
+            Dialog::SwitchProfile { name, pid } => {
+                if confirmed {
+                    if !self.gate_control("restart") {
+                        // Message already set; profile stays switched for view.
+                    } else if self.service.owned_by_app {
+                        self.initiate_stop(ctx, true, false);
+                    } else if let Some(pid) = pid {
+                        self.initiate_external_stop(ctx, pid, true, false);
+                    }
+                } else {
+                    self.note(format!("switched to {name} (view) — 'R' restarts with it"));
                 }
             }
         }
@@ -1029,6 +1112,25 @@ async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(pipe: R, tx: mpsc::Sender
     }
 }
 
+/// List selectable `*.json` config files in a directory, sorted by name.
+/// Hidden files and non-JSON files (e.g. `config.json.bak`) are skipped.
+pub fn scan_profiles(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "json")
+                && p.file_name()
+                    .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
 /// Main event loop. Returns the final-screen message for main to print after
 /// restoring the terminal (T039).
 pub async fn run(
@@ -1271,5 +1373,92 @@ mod tests {
 
         app.update_traffic(None);
         assert!(app.traffic_rate.is_none());
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sb-tui-profile-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scan_lists_sorted_json_only() {
+        let dir = temp_dir("scan");
+        fs::write(dir.join("config-ya.json"), "{}").unwrap();
+        fs::write(dir.join("config.json"), "{}").unwrap();
+        fs::write(dir.join("config.json.bak"), "{}").unwrap();
+        fs::write(dir.join("notes.txt"), "x").unwrap();
+        fs::write(dir.join(".hidden.json"), "{}").unwrap();
+
+        let names: Vec<String> = scan_profiles(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["config-ya.json", "config.json"],
+            "sorted, no bak/txt/hidden"
+        );
+        assert!(scan_profiles(&dir.join("missing")).is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Switching cycles profiles, reloads the config, and asks about a
+    /// restart when the service runs.
+    #[tokio::test]
+    async fn switch_profile_cycles_and_asks_when_running() {
+        let dir = temp_dir("switch");
+        fs::write(dir.join("a.json"), r#"{"route":{"final":"direct"}}"#).unwrap();
+        fs::write(dir.join("b.json"), r#"{"route":{"final":"proxy"}}"#).unwrap();
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::new(true, dir.join("a.json"));
+        let mut ctx = Ctx::new(tx, PathBuf::from("/bin/true"));
+        app.load_config();
+        assert_eq!(app.profiles.len(), 2);
+        assert_eq!(app.config.as_ref().unwrap().route.final_, "direct");
+
+        // Service stopped: switch silently moves the view.
+        app.switch_profile(&mut ctx, true);
+        assert_eq!(app.config_path, Some(dir.join("b.json")));
+        assert_eq!(app.config.as_ref().unwrap().route.final_, "proxy");
+        assert!(app.dialog.is_none());
+
+        // Wrap-around backwards.
+        app.switch_profile(&mut ctx, false);
+        assert_eq!(app.config_path, Some(dir.join("a.json")));
+
+        // Running service: switching offers a restart.
+        app.service.state = LifecycleState::Running;
+        app.service.pid = Some(999);
+        app.switch_profile(&mut ctx, true);
+        assert!(matches!(app.dialog, Some(Dialog::SwitchProfile { .. })));
+        // Decline keeps the switch view-only.
+        app.on_key(key(KeyCode::Char('n')), &mut ctx);
+        assert_eq!(app.config_path, Some(dir.join("b.json")));
+        assert!(app.dialog.is_none());
+        assert_eq!(
+            app.service.state,
+            LifecycleState::Running,
+            "decline never stops anything"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        }
     }
 }
