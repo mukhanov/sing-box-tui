@@ -1034,9 +1034,9 @@ async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(pipe: R, tx: mpsc::Sender
 pub async fn run(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     elevated: bool,
+    config_path: PathBuf,
 ) -> anyhow::Result<Option<String>> {
     let bin = process::find_singbox();
-    let config_path = config::resolve_config_path();
     let mut app = App::new(elevated, config_path.clone());
     app.load_config();
 

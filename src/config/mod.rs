@@ -9,8 +9,8 @@
 pub mod mask;
 pub mod parse;
 pub mod validate;
+pub mod vless;
 pub mod watch;
-
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 

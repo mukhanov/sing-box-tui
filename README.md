@@ -5,32 +5,41 @@ VPN on macOS. One screen, four always-visible panels — **Status**, **Ping**,
 **Config**, **Log** — refreshed continuously, answering "is my VPN up and is
 traffic actually flowing through it?" in a single command.
 
+## Launch
+
+```bash
+sudo sing-box-tui                          # default config, autostart
+sudo sing-box-tui -c ~/.config/sing-box/config-ya.json
+```
+
+
 All status is derived from observable state — the `sing-box` process
 (`pgrep`/`ps`), the tunnel interface (`ifconfig`), the read-only config file,
 and on-demand connectivity tests — because the management API is not enabled
 and the config is never modified.
 
-## Launch
-
-```bash
-sudo sing-box-tui
-```
-
-Launch-time elevation only: the app never prompts for a password. Without
-`sudo` every view keeps working; Start/Stop/Restart report as unavailable and
-privileged fields degrade to "unavailable" with a hint.
-
-When launched elevated with the service down, the service **starts
-automatically** (validated first; a failed validation shows the verbatim
-error and leaves the app usable).
-
-The **terminal window title** tracks the service: `sing-box: Running · ↓1.3 MB/s ↑651 KB/s`
-(throughput measured from the tunnel interface counters) or `sing-box: Stopped`.
-
+**Home resolution**: under `sudo`, the config is resolved against the
+*invoking* user's home (`SUDO_USER` → `dscl`), never root's:
 
 ```
 ~/.config/sing-box/config.json
 ```
+
+## Importing a vless:// link
+
+Convert a `vless://` sharing link into a new sing-box config, validate it
+with `sing-box check`, and exit. The generated profile mirrors the working
+shape (tun inbound, direct DNS, hijack-dns, private/direct rules, final →
+proxy; reality/tls/utls/ws/grpc fields from the link):
+
+```bash
+sing-box-tui --import 'vless://uuid@host:443?security=reality&sni=...&fp=chrome&pbk=...&sid=...&flow=xtls-rprx-vision#Label'
+    # → ~/.config/sing-box/config-Label.json
+sing-box-tui --import '...' -o /path/to/new.json
+```
+
+Never overwrites an existing file; written with 0600 (it carries
+credentials). See `sing-box-tui --help` for all flags.
 
 ## Keys
 
