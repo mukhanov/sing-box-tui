@@ -115,16 +115,10 @@ async fn fetch_ip_from(url: &str, interface: Option<&str>) -> Result<String, Str
 }
 
 /// The resulting public IP as seen through the given interface — for the
-/// window title. ipify first, ifconfig.me as fallback.
+/// window title. Single echo service (api.ipify.org); ifconfig.me is not
+/// used: it resets TLS from datacenter exit IPs (seen live 2026-10-05).
 pub async fn public_ip(interface: Option<&str>) -> Option<String> {
-    // ipify first: ifconfig.me resets TLS from datacenter exit IPs (seen
-    // live 2026-10-05), which would starve the title of an address.
-    for url in ["https://api.ipify.org", "https://ifconfig.me"] {
-        if let Ok(ip) = fetch_ip_from(url, interface).await {
-            return Some(ip);
-        }
-    }
-    None
+    fetch_ip(interface).await.ok()
 }
 
 /// The default outbound physical interface (`route -n get default`).
