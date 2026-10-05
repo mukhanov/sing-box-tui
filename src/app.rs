@@ -310,6 +310,12 @@ impl App {
         if let Some(cfg) = &self.config {
             self.service.active_outbound = config::active_outbound(cfg).map(|o| o.tag.clone());
         }
+        // A stopped service has no resulting address; the next running
+        // session refetches on its first tick.
+        if self.service.state == LifecycleState::Stopped {
+            self.vpn_ip = None;
+            self.ip_fetch_at = None;
+        }
     }
 
     /// Diff consecutive interface counter samples into a rate; no tunnel or
@@ -443,10 +449,10 @@ impl App {
                 self.service.version = self.version.clone();
             }
             AppEvent::PublicIp(ip) => {
-                // Keep the last known address on a failed refresh.
-                if ip.is_some() {
-                    self.vpn_ip = ip;
-                }
+                // A failed refresh means traffic no longer demonstrably
+                // exits at the old address (broken tunnel): show no IP
+                // rather than a stale one.
+                self.vpn_ip = ip;
             }
             AppEvent::StartDone(Ok(started)) => {
                 let pid = started.pid;
@@ -1401,7 +1407,23 @@ mod tests {
         );
         // Stopped never shows rates or the (stale) IP.
         app.service.state = LifecycleState::Stopped;
+        app.recompute();
         assert_eq!(app.title_text(), "sing-box: Stopped");
+        assert!(app.vpn_ip.is_none(), "stop clears the address");
+    }
+
+    /// A failed echo refresh (broken tunnel) drops the address instead of
+    /// showing a stale exit IP.
+    #[tokio::test]
+    async fn failed_ip_refresh_clears_address() {
+        let (mut app, mut ctx) = app_external_running();
+        app.vpn_ip = Some("195.201.136.249".into());
+        app.apply(AppEvent::PublicIp(None), &mut ctx);
+        assert!(app.vpn_ip.is_none());
+        assert_eq!(app.title_text(), "sing-box: Running");
+
+        app.apply(AppEvent::PublicIp(Some("178.176.79.178".into())), &mut ctx);
+        assert_eq!(app.vpn_ip.as_deref(), Some("178.176.79.178"));
     }
 
     /// Window title carries the state and, only while running with a rate,
@@ -1484,6 +1506,15 @@ mod profile_tests {
     /// Selecting with [ / ] only moves the cursor; Enter applies the
     /// selection, reloads the config, and asks about a restart when the
     /// service runs.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        }
+    }
+
     #[tokio::test]
     async fn profile_select_then_enter_applies() {
         let dir = temp_dir("switch");
@@ -1529,159 +1560,5 @@ mod profile_tests {
         assert_eq!(app.config_path, Some(dir.join("a.json")));
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::empty(),
-        }
-    }
-
-    fn app_external_running() -> (App, Ctx) {
-        let (tx, _rx) = mpsc::channel(8);
-        let mut app = App::new(false, PathBuf::from("/tmp/config.json"));
-        app.service.state = LifecycleState::Running;
-        app.service.pid = Some(4242);
-        app.service.owned_by_app = false;
-        (app, Ctx::new(tx, PathBuf::from("/bin/true")))
-    }
-
-    /// Declining the quit dialog leaves the external instance running and the
-    /// final screen states it (FR-019b, T039).
-    #[tokio::test]
-    async fn quit_external_declined_leaves_running() {
-        let (mut app, mut ctx) = app_external_running();
-        app.on_key(key(KeyCode::Char('q')), &mut ctx);
-        assert_eq!(app.dialog, Some(Dialog::QuitExternal { pid: 4242 }));
-        app.on_key(key(KeyCode::Char('n')), &mut ctx);
-        assert_eq!(
-            app.quit_outcome.as_deref(),
-            Some("service left running (pid 4242)")
-        );
-    }
-
-    /// Only y/n/Esc affect an open dialog; other keys are ignored.
-    #[tokio::test]
-    async fn dialog_ignores_other_keys() {
-        let (mut app, mut ctx) = app_external_running();
-        app.on_key(key(KeyCode::Char('q')), &mut ctx);
-        app.on_key(key(KeyCode::Char('x')), &mut ctx);
-        assert_eq!(app.dialog, Some(Dialog::QuitExternal { pid: 4242 }));
-    }
-
-    /// While the target input is open, all other keys route to the input —
-    /// no panel actions, no quit (contracts/ui.md, T022).
-    #[tokio::test]
-    async fn target_input_captures_all_keys() {
-        let (mut app, mut ctx) = app_external_running();
-        app.on_key(key(KeyCode::Char('t')), &mut ctx);
-        assert!(app.input.is_some());
-        for c in ['q', 'x', 's', 'c'] {
-            app.on_key(key(KeyCode::Char(c)), &mut ctx);
-        }
-        assert_eq!(app.input.as_ref().unwrap().buffer, "qxsc");
-        assert_eq!(
-            app.service.state,
-            LifecycleState::Running,
-            "no action taken"
-        );
-        app.on_key(key(KeyCode::Enter), &mut ctx);
-        assert!(app.input.is_none());
-        assert_eq!(app.custom_targets, vec!["qxsc".to_string()]);
-    }
-
-    /// Unprivileged start is gated with a message naming the needed action
-    /// and never starts anything (FR-020a, SC-013).
-    #[tokio::test]
-    async fn unprivileged_start_gated() {
-        let (mut app, mut ctx) = app_external_running();
-        app.service.state = LifecycleState::Stopped;
-        app.service.pid = None;
-        app.on_key(key(KeyCode::Char('s')), &mut ctx);
-        assert!(
-            app.action_error
-                .as_deref()
-                .unwrap()
-                .contains("sudo sing-box-tui")
-        );
-        assert_eq!(app.service.state, LifecycleState::Stopped);
-        assert!(!app.starting);
-    }
-
-    /// Quit with no service exits silently with an empty outcome.
-    #[tokio::test]
-    async fn quit_without_service_is_silent() {
-        let (tx, _rx) = mpsc::channel(8);
-        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
-        let mut ctx = Ctx::new(tx, PathBuf::from("/bin/true"));
-        app.on_key(key(KeyCode::Char('q')), &mut ctx);
-        assert_eq!(app.quit_outcome.as_deref(), Some(""));
-        assert!(!app.quitting);
-    }
-
-    /// Stopped presentation: health is Down and the reason names it; ping
-    /// results read as not measured while stopped (T017).
-    #[test]
-    fn stopped_presentation() {
-        let mut app = App::new(false, PathBuf::from("/tmp/config.json"));
-        app.checks.push(crate::service::ConnectivityCheck {
-            target: "example.com".into(),
-            status: crate::service::CheckStatus::Complete,
-            sent: 4,
-            received: 4,
-            loss: 0.0,
-            ..Default::default()
-        });
-        app.recompute();
-        assert_eq!(app.service.health, crate::service::HealthStatus::Down);
-        assert_eq!(
-            app.service.health_reason.as_deref(),
-            Some("service stopped")
-        );
-    }
-
-    /// Window title carries the state and, only while running with a rate,
-    /// the current throughput.
-    #[test]
-    fn title_tracks_state_and_rate() {
-        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
-        assert_eq!(app.title_text(), "sing-box: Stopped");
-
-        app.service.state = LifecycleState::Running;
-        assert_eq!(app.title_text(), "sing-box: Running");
-
-        app.traffic_rate = Some((1_258_291.2, 348_160.0));
-        assert_eq!(app.title_text(), "sing-box: Running · ↓1.2 MB/s ↑340 KB/s");
-
-        // Rate never shows while stopped (stale counters are not traffic).
-        app.service.state = LifecycleState::Stopped;
-        assert_eq!(app.title_text(), "sing-box: Stopped");
-    }
-
-    /// Two samples diff into a rate; one sample does not; losing the tunnel
-    /// clears it.
-    #[test]
-    fn traffic_diffing() {
-        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
-        app.update_traffic(Some((1000, 500)));
-        assert!(app.traffic_rate.is_none(), "first sample only baselines");
-
-        // Simulate an aged sample: rewind the stored timestamp.
-        if let Some((_bytes, at)) = app.last_traffic.as_mut() {
-            *at = std::time::Instant::now() - std::time::Duration::from_secs(2);
-        }
-        app.update_traffic(Some((3000, 1500)));
-        if let Some((down, up)) = app.traffic_rate {
-            assert!((down - 1000.0).abs() < 5.0, "down {down}");
-            assert!((up - 500.0).abs() < 5.0, "up {up}");
-        } else {
-            panic!("rate missing after second sample");
-        }
-
-        app.update_traffic(None);
-        assert!(app.traffic_rate.is_none());
     }
 }

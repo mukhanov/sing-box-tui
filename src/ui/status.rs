@@ -182,6 +182,9 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
             })
             .collect();
         l4.push(Span::raw(join_fit(&shown, 60)));
+        if let Some(ip) = &app.vpn_ip {
+            l4.push(dim(format!(" · exit {ip}")));
+        }
     } else {
         l4.push(dim("config not loaded"));
     }
