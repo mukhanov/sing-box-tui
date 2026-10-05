@@ -115,9 +115,11 @@ async fn fetch_ip_from(url: &str, interface: Option<&str>) -> Result<String, Str
 }
 
 /// The resulting public IP as seen through the given interface — for the
-/// window title. ifconfig.me first (user's pick), ipify as fallback.
+/// window title. ipify first, ifconfig.me as fallback.
 pub async fn public_ip(interface: Option<&str>) -> Option<String> {
-    for url in ["https://ifconfig.me", "https://api.ipify.org"] {
+    // ipify first: ifconfig.me resets TLS from datacenter exit IPs (seen
+    // live 2026-10-05), which would starve the title of an address.
+    for url in ["https://api.ipify.org", "https://ifconfig.me"] {
         if let Ok(ip) = fetch_ip_from(url, interface).await {
             return Some(ip);
         }

@@ -1251,10 +1251,10 @@ pub async fn run(
                 if app.version.is_none() {
                     ctx.spawn_version();
                 }
-                // Resulting public IP for the title: refresh every 30 s
+                // Resulting public IP for the title: refresh every 60 s
                 // while the tunnel is up (an echo request per tick would be
                 // chatty).
-                const IP_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+                const IP_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
                 let ip_due = app
                     .ip_fetch_at
                     .is_none_or(|at| at.elapsed() >= IP_REFRESH);
