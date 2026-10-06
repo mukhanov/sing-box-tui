@@ -340,10 +340,15 @@ impl App {
         }
     }
 
-    /// Terminal window title: colored state glyph + protocol + throughput +
-    /// exit IP. Pure — unit-tested.
+    /// Terminal window title: colored state glyph + protocol + exit IP +
+    /// throughput. Pure — unit-tested.
     pub fn title_text(&self) -> String {
         let mut title = format!("{} {}", self.state_glyph(), self.protocol_label());
+        if let Some(ip) = &self.vpn_ip
+            && self.service.state == LifecycleState::Running
+        {
+            title.push_str(&format!(" · {ip}"));
+        }
         if let Some((down, up)) = self.traffic_rate
             && self.service.state == LifecycleState::Running
         {
@@ -352,11 +357,6 @@ impl App {
                 crate::net::traffic::fmt_rate(down),
                 crate::net::traffic::fmt_rate(up)
             ));
-        }
-        if let Some(ip) = &self.vpn_ip
-            && self.service.state == LifecycleState::Running
-        {
-            title.push_str(&format!(" · {ip}"));
         }
         title
     }
@@ -1428,7 +1428,7 @@ mod tests {
         app.vpn_ip = Some("195.201.136.249".into());
         assert_eq!(
             app.title_text(),
-            "🟢 sing-box · ↓1.2 MB/s ↑340 KB/s · 195.201.136.249"
+            "🟢 sing-box · 195.201.136.249 · ↓1.2 MB/s ↑340 KB/s"
         );
         // Stopped never shows rates or the (stale) IP.
         app.service.state = LifecycleState::Stopped;

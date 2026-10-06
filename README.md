@@ -18,8 +18,7 @@ automatically** (validated first). The **terminal window title** shows a
 colored state glyph, the active protocol (vless/vmess/trojan/…), live
 throughput, and the resulting public IP
 (api.ipify.org through the tunnel, refreshed every 60 s):
-`🟢 vless · ↓1.3 MB/s ↑651 KB/s · 195.201.136.249` / `🔴 vless`.
-
+`🟢 vless · 195.201.136.249 · ↓1.3 MB/s ↑651 KB/s` / `🔴 vless`.
 All status is derived from observable state — the `sing-box` process
 (`pgrep`/`ps`), the tunnel interface (`ifconfig`), the read-only config file,
 and on-demand connectivity tests — because the management API is not enabled
