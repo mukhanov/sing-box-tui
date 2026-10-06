@@ -40,14 +40,19 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(warn, banner);
     }
 
-    let status_height = status::content_height(app);
-    let chunks = layout::dashboard_layout(area, status_height);
-    let columns = layout::three_columns(chunks[1]);
+    // Top row: Status (left) + Ping (right); the row is tall enough for
+    // Status content and at least 12 lines so Ping shows several targets.
+    let top_height = status::content_height(app)
+        .max(12)
+        .min(area.height.saturating_sub(6).max(6));
+    let rows = layout::dashboard_layout(area, top_height);
+    let top = layout::split_columns(rows[0], 1, 1);
+    let bottom = layout::split_columns(rows[1], 1, 2);
 
-    status::render(f, chunks[0], app);
-    ping::render(f, columns[0], app);
-    config_view::render(f, columns[1], app);
-    log_view::render(f, columns[2], app);
+    status::render(f, top[0], app);
+    ping::render(f, top[1], app);
+    config_view::render(f, bottom[0], app);
+    log_view::render(f, bottom[1], app);
 
     // Overlays last so they sit on top.
     if app.input.is_some() {

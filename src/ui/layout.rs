@@ -1,8 +1,9 @@
-//! Dashboard layout (T006, FR-013, FR-022, contracts/ui.md).
+//! Dashboard layout (FR-013, FR-022, contracts/ui.md; revised 2026-10-06).
 //!
-//! Status is a fixed-height top row; the remaining space splits into three
-//! equal columns (Ping, Config, Log). Minimum 80×24 keeps all four panels
-//! visible with Status fully visible.
+//! Quadrant layout: Status top-left, Ping top-right, Config bottom-left
+//! (1/3 of the width — the wide Log gets 2/3 so connection addresses fit
+//! whole). Minimum 80×24 keeps all four panels visible with Status fully
+//! visible.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
@@ -10,25 +11,25 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
 
-/// Vertical split: [status, rest]. Status height adapts to its content
-/// (banner/error lines) but never shrinks below the 6-line contract minimum.
-pub fn dashboard_layout(area: Rect, status_height: u16) -> Vec<Rect> {
-    let status_height = status_height.clamp(6, area.height.saturating_sub(6).max(6));
+/// Vertical split into [top row, bottom row]. The top row never shrinks
+/// below 4 lines nor eats the bottom below 4.
+pub fn dashboard_layout(area: Rect, top_height: u16) -> Vec<Rect> {
+    let top_height = top_height.clamp(4, area.height.saturating_sub(4).max(4));
     Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(status_height), Constraint::Fill(1)])
+        .constraints([Constraint::Length(top_height), Constraint::Fill(1)])
         .split(area)
         .to_vec()
 }
 
-/// Three equal columns for Ping/Config/Log.
-pub fn three_columns(area: Rect) -> Vec<Rect> {
+/// Horizontal split by ratio (`left`:`right`), e.g. (1, 1) halves,
+/// (1, 2) one-third / two-thirds.
+pub fn split_columns(area: Rect, left: u32, right: u32) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
+            Constraint::Ratio(left, left + right),
+            Constraint::Ratio(right, left + right),
         ])
         .split(area)
         .to_vec()
@@ -49,4 +50,40 @@ pub fn popup_area(area: Rect, width: u16, height: u16) -> Rect {
 /// Is the terminal at least the minimum size?
 pub fn is_minimum_size(area: Rect) -> bool {
     area.width >= MIN_WIDTH && area.height >= MIN_HEIGHT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(w: u16, h: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn quadrants_at_80x24() {
+        let rows = dashboard_layout(area(80, 24), 12);
+        assert_eq!(rows[0].height, 12, "top row keeps its height");
+        assert_eq!(rows[1].height, 12, "bottom fills the rest");
+
+        let top = split_columns(rows[0], 1, 1);
+        assert_eq!(top[0].width, 40, "Status = half");
+        assert_eq!(top[1].width, 40, "Ping = half");
+
+        let bottom = split_columns(rows[1], 1, 2);
+        assert_eq!(bottom[0].width, 27, "Config ≈ 1/3 (rounded)");
+        assert_eq!(bottom[1].width, 53, "Log ≈ 2/3");
+    }
+
+    #[test]
+    fn top_row_clamped_on_tiny_terminals() {
+        let rows = dashboard_layout(area(80, 8), 12);
+        assert!(rows[0].height >= 4, "top never collapses");
+        assert!(rows[1].height >= 4, "bottom never collapses");
+    }
 }

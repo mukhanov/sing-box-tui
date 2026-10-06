@@ -74,6 +74,14 @@ Confirmation dialogs accept `y` / `n` / `Esc` only.
 
 ## Panels
 
+```text
+┌ STATUS ───────────┬ PING ─────────────┐
+│                   │                   │
+├ CONFIG (1/3) ─────┼ LOG (2/3) ────────┤
+│                   │                   │
+└───────────────────┴───────────────────┘
+```
+
 - **Status** — lifecycle state, pid, uptime, version, config path, tunnel
   name/address/MTU, active vs idle outbounds, DNS servers + strategy, and a
   health badge (`Healthy` / `Degraded` / `Down`) with the reason for anything
