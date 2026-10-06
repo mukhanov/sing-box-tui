@@ -340,10 +340,10 @@ impl App {
         }
     }
 
-    /// Terminal window title: colored state glyph + throughput + exit IP.
-    /// Pure — unit-tested.
+    /// Terminal window title: colored state glyph + protocol + throughput +
+    /// exit IP. Pure — unit-tested.
     pub fn title_text(&self) -> String {
-        let mut title = format!("{} sing-box", self.state_glyph());
+        let mut title = format!("{} {}", self.state_glyph(), self.protocol_label());
         if let Some((down, up)) = self.traffic_rate
             && self.service.state == LifecycleState::Running
         {
@@ -372,6 +372,18 @@ impl App {
                 _ => "🟢",
             },
         }
+    }
+
+    /// The active outbound's protocol (vless, vmess, trojan, wireguard,
+    /// direct…) — the title's subject. Falls back to "sing-box" when the
+    /// config is unavailable.
+    pub fn protocol_label(&self) -> String {
+        if let Some(cfg) = &self.config
+            && let Some(out) = config::active_outbound(cfg)
+        {
+            return out.ty.clone();
+        }
+        "sing-box".to_string()
     }
     /// Check lookup by target for live updates.
     fn check_mut(&mut self, target: &str) -> Option<&mut crate::service::ConnectivityCheck> {
@@ -1438,6 +1450,47 @@ mod tests {
         assert_eq!(app.state_glyph(), "🟡");
         app.service.state = LifecycleState::Stopped;
         assert_eq!(app.state_glyph(), "🔴");
+    }
+
+    /// The title names the active outbound's protocol, falling back to
+    /// "sing-box" only without a config.
+    #[test]
+    fn title_uses_protocol_of_active_outbound() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        // No config loaded → fallback.
+        assert!(app.title_text().starts_with("🔴 sing-box"));
+
+        app.config = Some(
+            serde_json::from_str(
+                r#"{"outbounds":[{"type":"vless","tag":"proxy","server":"s"},{"type":"direct","tag":"direct"}],"route":{"final":"proxy"}}"#,
+            )
+            .unwrap(),
+        );
+        app.service.state = LifecycleState::Running;
+        app.recompute();
+        // No tunnel in this fixture → Degraded; force healthy to assert the
+        // protocol part deterministically.
+        app.service.health = crate::service::HealthStatus::Healthy;
+        assert!(
+            app.title_text().starts_with("🟢 vless"),
+            "{}",
+            app.title_text()
+        );
+
+        // A direct-final profile names direct.
+        app.config = Some(
+            serde_json::from_str(
+                r#"{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}"#,
+            )
+            .unwrap(),
+        );
+        app.recompute();
+        app.service.health = crate::service::HealthStatus::Healthy;
+        assert!(
+            app.title_text().starts_with("🟢 direct"),
+            "{}",
+            app.title_text()
+        );
     }
 
     /// A failed echo refresh (broken tunnel) drops the address instead of

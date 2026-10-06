@@ -15,10 +15,10 @@ sudo sing-box-tui -c ~/.config/sing-box/config-ya.json
 Launch-time elevation only: the app never prompts for a password. When
 launched elevated with the service down, the service **starts
 automatically** (validated first). The **terminal window title** shows a
-colored state glyph, live throughput, and the resulting public IP
+colored state glyph, the active protocol (vless/vmess/trojan/…), live
+throughput, and the resulting public IP
 (api.ipify.org through the tunnel, refreshed every 60 s):
-`🟢 sing-box · ↓1.3 MB/s ↑651 KB/s · 195.201.136.249` / `🔴 sing-box`.
-🔴 stopped · 🟡 starting/stopping · 🟢 running+healthy · 🟠 running+degraded.
+`🟢 vless · ↓1.3 MB/s ↑651 KB/s · 195.201.136.249` / `🔴 vless`.
 
 All status is derived from observable state — the `sing-box` process
 (`pgrep`/`ps`), the tunnel interface (`ifconfig`), the read-only config file,
