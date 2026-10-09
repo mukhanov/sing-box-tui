@@ -5,6 +5,13 @@ VPN on macOS. One screen, four always-visible panels — **Status**, **Ping**,
 **Config**, **Log** — refreshed continuously, answering "is my VPN up and is
 traffic actually flowing through it?" in a single command.
 
+## Install
+
+```bash
+./install.sh                # builds release and installs to /usr/local/bin
+./install.sh ~/.local       # or any prefix: binary lands in <prefix>/bin
+```
+
 ## Launch
 
 ```bash
