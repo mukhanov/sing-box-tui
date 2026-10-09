@@ -31,16 +31,26 @@ pub fn default_targets(config: &SingBoxConfig) -> Vec<String> {
     }
 
     // Proxy server(s).
-    for outbound in &config.outbounds {
-        if !outbound.server.is_empty() && outbound.ty != "direct" {
-            push(outbound.server.clone(), &mut targets);
-        }
+    for host in server_hosts(config) {
+        push(host, &mut targets);
     }
 
     // One public host.
     push("example.com".to_string(), &mut targets);
 
     targets
+}
+
+/// Hosts of the configured proxy outbounds (T020). Checks against them are
+/// diagnostic only: proxy servers commonly drop ICMP echo by policy, so
+/// their silence says nothing about the tunnel (see `recompute_health`).
+pub fn server_hosts(config: &SingBoxConfig) -> Vec<String> {
+    config
+        .outbounds
+        .iter()
+        .filter(|o| !o.server.is_empty() && o.ty != "direct")
+        .map(|o| o.server.clone())
+        .collect()
 }
 
 #[cfg(test)]

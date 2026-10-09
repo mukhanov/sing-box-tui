@@ -4,6 +4,9 @@
 //! - `Down` when state is Stopped
 //! - `Degraded` when state is Running but tunnel is missing or has no address
 //! - `Degraded` when any connectivity check has failed or been blocked
+//!   (checks against a proxy server's own host are exempt — such hosts
+//!   commonly drop ICMP echo; the tunnel carrying traffic is the evidence
+//!   they are reachable)
 //! - `Healthy` only when state is Running, tunnel is present with address,
 //!   and no connectivity check has failed
 
@@ -322,4 +325,66 @@ fn probe_application_tracks_external_instance() {
     };
     s.apply_probe(&gone);
     assert_eq!(s.state, LifecycleState::Stopped);
+}
+
+/// Regression: a proxy server host that drops ICMP echo (naive endpoints
+/// commonly do) must not degrade the badge while every other check passes —
+/// the tunnel carrying traffic is itself the evidence the server is up.
+/// The lost-ping row stays in the Ping panel as a diagnostic.
+#[test]
+fn server_host_icmp_loss_does_not_degrade_health() {
+    let mut s = ServiceInstance::default();
+    s.state = LifecycleState::Running;
+    s.tunnel = Some(sing_box_tui::service::tunnel::TunnelInfo {
+        name: "utun6".into(),
+        address: Some("172.18.0.1".into()),
+        mtu: Some(1400),
+    });
+    let checks = vec![
+        ConnectivityCheck {
+            target: "ivmvs.wlld.dev".into(),
+            status: CheckStatus::Failed,
+            sent: 4,
+            loss: 100.0,
+            failure_reason: Some(FailureReason::NoReply),
+            ..Default::default()
+        },
+        ConnectivityCheck {
+            target: "77.88.8.8".into(),
+            status: CheckStatus::Complete,
+            sent: 4,
+            received: 4,
+            ..Default::default()
+        },
+    ];
+    s.recompute_health(&checks, &["ivmvs.wlld.dev".to_string()]);
+    assert_eq!(s.health, HealthStatus::Healthy);
+    assert!(s.health_reason.is_none());
+}
+
+/// FR-007 keeps its teeth: a failing target that is not the proxy server's
+/// own host still degrades the badge with the named reason.
+#[test]
+fn other_target_failure_still_degrades() {
+    let mut s = ServiceInstance::default();
+    s.state = LifecycleState::Running;
+    s.tunnel = Some(sing_box_tui::service::tunnel::TunnelInfo {
+        name: "utun6".into(),
+        address: Some("172.18.0.1".into()),
+        mtu: Some(1400),
+    });
+    let checks = vec![ConnectivityCheck {
+        target: "77.88.8.8".into(),
+        status: CheckStatus::Failed,
+        sent: 4,
+        loss: 100.0,
+        failure_reason: Some(FailureReason::NoReply),
+        ..Default::default()
+    }];
+    s.recompute_health(&checks, &["ivmvs.wlld.dev".to_string()]);
+    assert_eq!(s.health, HealthStatus::Degraded);
+    assert_eq!(
+        s.health_reason.as_deref(),
+        Some("a connectivity check failed or was blocked")
+    );
 }

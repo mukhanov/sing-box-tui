@@ -306,7 +306,8 @@ impl App {
     pub fn recompute(&mut self) {
         self.service
             .check_not_responding(crate::service::NOT_RESPONDING_AFTER);
-        self.service.recompute_health(&self.checks);
+        let server_hosts = self.config.as_ref().map(net::server_hosts).unwrap_or_default();
+        self.service.recompute_health(&self.checks, &server_hosts);
         if let Some(cfg) = &self.config {
             self.service.active_outbound = config::active_outbound(cfg).map(|o| o.tag.clone());
         }

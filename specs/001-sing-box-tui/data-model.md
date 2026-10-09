@@ -158,6 +158,10 @@ Overall verdict derived from service state, tunnel state, and connectivity check
 - `Down` when state is Stopped
 - `Degraded` when state is Running but tunnel is missing or has no address
 - `Degraded` when any connectivity check has failed or been blocked
+  (amendment 2026-10-09: checks against a proxy server's own host are exempt
+  — such hosts commonly drop ICMP echo by policy, and the tunnel carrying
+  traffic is the evidence they are reachable; the lost-ping row stays in the
+  Ping panel as a diagnostic)
 - `Healthy` only when state is Running, tunnel is present with address, and no connectivity check has failed
 
 ---
@@ -229,7 +233,8 @@ The application maintains session-only state (no persistence between runs):
 3. **Health Status**:
    - Must be `Down` when state is Stopped
    - Must be `Degraded` when tunnel is missing or has no address
-   - Must be `Degraded` when any connectivity check failed
+   - Must be `Degraded` when any connectivity check failed (proxy-server-host
+     checks exempt — see HealthStatus Derivation Rules)
    - Must be `Healthy` only when all conditions are satisfied
 
 4. **Configuration**:

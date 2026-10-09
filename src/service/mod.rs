@@ -58,6 +58,8 @@ impl HealthStatus {
 /// - `Down` when state is Stopped
 /// - `Degraded` when state is Running but tunnel is missing or has no address
 /// - `Degraded` when any connectivity check has failed or been blocked
+///   (checks against a proxy server's own host are exempt — see
+///   `recompute_health`)
 /// - `Healthy` only when state is Running, tunnel is present with address,
 ///   and no connectivity check has failed
 pub fn derive_health(
@@ -301,13 +303,24 @@ impl ServiceInstance {
     }
 
     /// Recompute the health badge from current state, tunnel, and checks.
-    pub fn recompute_health(&mut self, checks: &[ConnectivityCheck]) {
+    ///
+    /// `server_hosts` names the configured proxy server hosts: their checks
+    /// are excluded from the verdict. Proxy servers commonly drop ICMP echo
+    /// by policy (a naive endpoint on :8443 has no reason to answer), so a
+    /// lost ping there says nothing about the tunnel — the tunnel carrying
+    /// traffic and the remaining through-tunnel checks are the real evidence
+    /// the server is reachable. Their rows stay in the Ping panel as
+    /// diagnostics.
+    pub fn recompute_health(&mut self, checks: &[ConnectivityCheck], server_hosts: &[String]) {
         let tunnel_present = self.tunnel.is_some();
         let tunnel_has_address = self
             .tunnel
             .as_ref()
             .is_some_and(|t| t.address.as_deref().is_some_and(|a| !a.is_empty()));
-        let any_failed = checks.iter().any(ConnectivityCheck::failed_for_health);
+        let any_failed = checks
+            .iter()
+            .filter(|c| !server_hosts.iter().any(|s| s == &c.target))
+            .any(ConnectivityCheck::failed_for_health);
         self.health = derive_health(self.state, tunnel_present, tunnel_has_address, any_failed);
 
         self.health_reason = match self.health {
