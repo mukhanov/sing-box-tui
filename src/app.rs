@@ -105,6 +105,9 @@ pub enum AppEvent {
         tunnel: Option<TunnelInfo>,
         /// Cumulative interface counters, for the throughput diff.
         traffic: Option<(u64, u64)>,
+        /// urltest members with live connections this tick (None when not
+        /// observable — service down, no group, or observation failure).
+        observed_members: Option<Vec<String>>,
         changed: bool,
     },
     Version(String),
@@ -166,6 +169,16 @@ pub struct App {
     pub vpn_ip: Option<String>,
     ip_fetch_at: Option<std::time::Instant>,
 
+    /// Member of the active urltest group actually carrying traffic (tag),
+    /// observed from the sing-box process's own connections; sticky across
+    /// ticks (urltest groups re-pick their member at runtime).
+    pub active_member: Option<String>,
+    /// First sighting of a different member — it replaces `active_member`
+    /// only when confirmed by the next observation, so the group's
+    /// short-lived health probes (one connection to every member) never
+    /// flip the pick.
+    member_candidate: Option<String>,
+
     /// One-shot: attempt to start the service at launch when elevated and
     /// the service is down (user request 2026-10-05).
     autostart_tried: bool,
@@ -219,6 +232,9 @@ impl App {
                 Ok(cfg) => {
                     self.config = Some(cfg);
                     self.config_changed = false;
+                    // A new config may name a different group or members.
+                    self.active_member = None;
+                    self.member_candidate = None;
                 }
                 Err(e) => {
                     self.config_error = Some(format!("{}: invalid JSON: {e}", path.display()));
@@ -306,16 +322,71 @@ impl App {
     pub fn recompute(&mut self) {
         self.service
             .check_not_responding(crate::service::NOT_RESPONDING_AFTER);
-        let server_hosts = self.config.as_ref().map(net::server_hosts).unwrap_or_default();
+        let server_hosts = self
+            .config
+            .as_ref()
+            .map(net::server_hosts)
+            .unwrap_or_default();
         self.service.recompute_health(&self.checks, &server_hosts);
-        if let Some(cfg) = &self.config {
-            self.service.active_outbound = config::active_outbound(cfg).map(|o| o.tag.clone());
-        }
+        // Active outbound for display: a urltest group resolves to the
+        // observed member (the group itself is a technical construct).
+        let active_tag = self.config.as_ref().and_then(|cfg| {
+            config::urltest_group(cfg)
+                .map(|group| config::group_members(cfg, group))
+                .and_then(|members| {
+                    self.active_member
+                        .as_deref()
+                        .filter(|t| members.iter().any(|m| m.tag == *t))
+                        .or_else(|| members.first().map(|m| m.tag.as_str()))
+                        .map(str::to_string)
+                })
+                .or_else(|| config::active_outbound(cfg).map(|o| o.tag.clone()))
+        });
+        self.service.active_outbound = active_tag;
         // A stopped service has no resulting address; the next running
         // session refetches on its first tick.
         if self.service.state == LifecycleState::Stopped {
             self.vpn_ip = None;
             self.ip_fetch_at = None;
+        }
+    }
+
+    /// Observable endpoints of the active urltest group's members, for
+    /// connection-based resolution of the member carrying traffic.
+    pub fn urltest_member_endpoints(&self) -> Vec<crate::service::conns::MemberEndpoint> {
+        let Some(cfg) = &self.config else {
+            return Vec::new();
+        };
+        let Some(group) = config::urltest_group(cfg) else {
+            return Vec::new();
+        };
+        config::group_members(cfg, group)
+            .into_iter()
+            .filter_map(|o| Some((o.tag.clone(), o.server.clone(), o.server_port?)))
+            .collect()
+    }
+
+    /// Fold one observation of members with live connections into the
+    /// sticky pick. None (observation failed) keeps everything; an empty or
+    /// multi-member sighting keeps the pick too (idle, or the group's
+    /// probes); a switch needs the new member on two consecutive
+    /// observations.
+    fn observe_member(&mut self, observed: Option<Vec<String>>) {
+        let Some(live) = observed else { return };
+        if self
+            .active_member
+            .as_ref()
+            .is_some_and(|m| live.contains(m))
+        {
+            self.member_candidate = None;
+        } else if self
+            .member_candidate
+            .as_ref()
+            .is_some_and(|m| live.contains(m))
+        {
+            self.active_member = self.member_candidate.take();
+        } else {
+            self.member_candidate = (live.len() == 1).then(|| live[0].clone());
         }
     }
 
@@ -341,10 +412,19 @@ impl App {
         }
     }
 
-    /// Terminal window title: colored state glyph + protocol + exit IP +
-    /// throughput. Pure — unit-tested.
+    /// Terminal window title: colored state glyph + protocol + active
+    /// outbound + exit IP + throughput. Pure — unit-tested.
     pub fn title_text(&self) -> String {
-        let mut title = format!("{} {}", self.state_glyph(), self.protocol_label());
+        let proto = self.protocol_label();
+        let mut title = format!("{} {}", self.state_glyph(), proto);
+        // The active outbound's tag (for a urltest group: the observed
+        // member — the group itself is technical). Skipped when the tag
+        // adds nothing (e.g. `direct`).
+        if let Some(tag) = &self.service.active_outbound
+            && tag != &proto
+        {
+            title.push_str(&format!(" → {tag}"));
+        }
         if let Some(ip) = &self.vpn_ip
             && self.service.state == LifecycleState::Running
         {
@@ -376,16 +456,23 @@ impl App {
     }
 
     /// The active outbound's protocol (vless, vmess, trojan, wireguard,
-    /// direct…) — the title's subject. Falls back to "sing-box" when the
-    /// config is unavailable.
+    /// direct…) — the title's subject. For a urltest group this is the
+    /// observed member's protocol. Falls back to "sing-box" when the config
+    /// is unavailable.
     pub fn protocol_label(&self) -> String {
         if let Some(cfg) = &self.config
-            && let Some(out) = config::active_outbound(cfg)
+            && let Some(out) = self
+                .service
+                .active_outbound
+                .as_deref()
+                .and_then(|tag| cfg.outbounds.iter().find(|o| o.tag == tag))
+                .or_else(|| config::active_outbound(cfg))
         {
             return out.ty.clone();
         }
         "sing-box".to_string()
     }
+
     /// Check lookup by target for live updates.
     fn check_mut(&mut self, target: &str) -> Option<&mut crate::service::ConnectivityCheck> {
         self.checks.iter_mut().find(|c| c.target == target)
@@ -431,6 +518,7 @@ impl App {
                 probe,
                 tunnel,
                 traffic,
+                observed_members,
                 changed,
             } => {
                 let was = self.service.state;
@@ -440,7 +528,12 @@ impl App {
                 }
                 if self.service.state == LifecycleState::Running {
                     self.service.tunnel = tunnel;
+                } else {
+                    // A stopped service proves nothing about members.
+                    self.active_member = None;
+                    self.member_candidate = None;
                 }
+                self.observe_member(observed_members);
                 if changed {
                     self.config_changed = true;
                 }
@@ -613,7 +706,7 @@ impl App {
 
     pub fn refresh_now(&mut self, ctx: &Ctx) {
         if !self.refresh_in_flight {
-            ctx.spawn_refresh();
+            ctx.spawn_refresh(self.urltest_member_endpoints());
             self.refresh_in_flight = true;
         }
     }
@@ -1023,7 +1116,7 @@ impl Ctx {
         self.child = Some(child);
     }
 
-    fn spawn_refresh(&self) {
+    fn spawn_refresh(&self, members: Vec<crate::service::conns::MemberEndpoint>) {
         let tx = self.evt_tx.clone();
         let known_pid = self.child.as_ref().and_then(|c| c.id());
         tokio::spawn(async move {
@@ -1041,11 +1134,20 @@ impl Ctx {
                 Some(t) => crate::net::traffic::interface_bytes(&t.name).await,
                 None => None,
             };
+            // Which urltest members hold live connections right now (None
+            // when there is nothing to observe or observation fails).
+            let observed_members = match probe.as_ref().filter(|p| p.alive).and_then(|p| p.pid) {
+                Some(pid) if !members.is_empty() => {
+                    crate::service::conns::members_with_live_conns(pid, &members).await
+                }
+                _ => None,
+            };
             let _ = tx
                 .send(AppEvent::Probe {
                     probe,
                     tunnel,
                     traffic,
+                    observed_members,
                     changed: false,
                 })
                 .await;
@@ -1221,7 +1323,7 @@ pub async fn run(
     use futures::StreamExt;
 
     // Initial probe + validation + version.
-    ctx.spawn_refresh();
+    ctx.spawn_refresh(app.urltest_member_endpoints());
     app.refresh_in_flight = true;
     ctx.spawn_validate(config_path);
     app.validating = true;
@@ -1258,7 +1360,7 @@ pub async fn run(
             }
             _ = tick.tick() => {
                 if !app.refresh_in_flight {
-                    ctx.spawn_refresh();
+                    ctx.spawn_refresh(app.urltest_member_endpoints());
                     app.refresh_in_flight = true;
                 }
                 if app.version.is_none() {
@@ -1453,8 +1555,8 @@ mod tests {
         assert_eq!(app.state_glyph(), "🔴");
     }
 
-    /// The title names the active outbound's protocol, falling back to
-    /// "sing-box" only without a config.
+    /// The title names the active outbound's protocol and tag, falling back
+    /// to "sing-box" only without a config.
     #[test]
     fn title_uses_protocol_of_active_outbound() {
         let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
@@ -1472,13 +1574,9 @@ mod tests {
         // No tunnel in this fixture → Degraded; force healthy to assert the
         // protocol part deterministically.
         app.service.health = crate::service::HealthStatus::Healthy;
-        assert!(
-            app.title_text().starts_with("🟢 vless"),
-            "{}",
-            app.title_text()
-        );
+        assert_eq!(app.title_text(), "🟢 vless → proxy", "{}", app.title_text());
 
-        // A direct-final profile names direct.
+        // A direct-final profile names direct (tag adds nothing — no arrow).
         app.config = Some(
             serde_json::from_str(
                 r#"{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}"#,
@@ -1487,11 +1585,87 @@ mod tests {
         );
         app.recompute();
         app.service.health = crate::service::HealthStatus::Healthy;
+        assert_eq!(app.title_text(), "🟢 direct");
+    }
+
+    fn urltest_config() -> SingBoxConfig {
+        serde_json::from_str(
+            r#"{
+          "outbounds": [
+            {"type":"naive","tag":"naive-a","server":"ivmvs.wlld.dev","server_port":8443},
+            {"type":"naive","tag":"naive-b","server":"ivnsk.wlld.dev","server_port":8443},
+            {"type":"urltest","tag":"proxy","outbounds":["naive-a","naive-b"]},
+            {"type":"direct","tag":"direct"}
+          ],
+          "route": {"final": "proxy"}
+        }"#,
+        )
+        .unwrap()
+    }
+
+    /// A urltest final is technical: the title names the member actually
+    /// carrying traffic (observed), defaulting to the first member until
+    /// the first observation lands.
+    #[test]
+    fn title_resolves_urltest_to_member() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        app.config = Some(urltest_config());
+        app.service.state = LifecycleState::Running;
+        app.recompute();
+        app.service.health = crate::service::HealthStatus::Healthy;
         assert!(
-            app.title_text().starts_with("🟢 direct"),
+            app.title_text().starts_with("🟢 naive → naive-a"),
             "{}",
             app.title_text()
         );
+
+        // Observed member wins over the first-member fallback.
+        app.active_member = Some("naive-b".into());
+        app.recompute();
+        app.service.health = crate::service::HealthStatus::Healthy;
+        assert!(
+            app.title_text().starts_with("🟢 naive → naive-b"),
+            "{}",
+            app.title_text()
+        );
+
+        // An active member that left the config is dropped.
+        app.active_member = Some("gone".into());
+        app.recompute();
+        app.service.health = crate::service::HealthStatus::Healthy;
+        assert!(
+            app.title_text().starts_with("🟢 naive → naive-a"),
+            "{}",
+            app.title_text()
+        );
+    }
+
+    /// urltest re-picks its member at runtime and probes every member on
+    /// an interval: a switch must be confirmed by two consecutive
+    /// observations, and idle/failed/multi-member sightings keep the pick.
+    #[test]
+    fn member_switch_needs_two_consecutive_sightings() {
+        let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
+        app.config = Some(urltest_config());
+        app.active_member = Some("naive-a".into());
+
+        app.observe_member(None); // observation failed
+        assert_eq!(app.active_member.as_deref(), Some("naive-a"));
+        app.observe_member(Some(vec![])); // idle: conns closed
+        assert_eq!(app.active_member.as_deref(), Some("naive-a"));
+        app.observe_member(Some(vec!["naive-a".into(), "naive-b".into()])); // probes
+        assert_eq!(app.active_member.as_deref(), Some("naive-a"));
+        assert!(app.member_candidate.is_none());
+
+        // First sighting of naive-b alone: candidate, not yet the pick.
+        app.observe_member(Some(vec!["naive-b".into()]));
+        assert_eq!(app.active_member.as_deref(), Some("naive-a"));
+        assert_eq!(app.member_candidate.as_deref(), Some("naive-b"));
+
+        // Confirmed on the next observation.
+        app.observe_member(Some(vec!["naive-b".into()]));
+        assert_eq!(app.active_member.as_deref(), Some("naive-b"));
+        assert!(app.member_candidate.is_none());
     }
 
     /// A failed echo refresh (broken tunnel) drops the address instead of

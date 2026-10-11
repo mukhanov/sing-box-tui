@@ -89,6 +89,26 @@ pub fn active_outbound(config: &SingBoxConfig) -> Option<&Outbound> {
     resolved
 }
 
+/// The urltest group acting as the active outbound, when it is one. A
+/// urltest is a purely technical construct: it picks its member at runtime,
+/// so display layers resolve to the member instead (observed live by the
+/// app; see `service::conns`).
+pub fn urltest_group(config: &SingBoxConfig) -> Option<&Outbound> {
+    let active = active_outbound(config)?;
+    (active.ty == "urltest").then_some(active)
+}
+
+/// The concrete (server-bearing) members of a group outbound, in the order
+/// the group lists them.
+pub fn group_members<'a>(config: &'a SingBoxConfig, group: &Outbound) -> Vec<&'a Outbound> {
+    group
+        .outbounds
+        .iter()
+        .filter_map(|tag| config.outbounds.iter().find(|o| &o.tag == tag))
+        .filter(|o| !o.server.is_empty() && o.server_port.is_some())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +147,36 @@ mod tests {
             active_outbound(&cfg2).map(|o| o.tag.as_str()),
             Some("proxy")
         );
+    }
+
+    #[test]
+    fn urltest_group_and_members_resolve() {
+        let cfg: SingBoxConfig = serde_json::from_str(
+            r#"{
+          "outbounds": [
+            {"type":"naive","tag":"naive-a","server":"a.example","server_port":8443},
+            {"type":"naive","tag":"naive-b","server":"b.example","server_port":8443},
+            {"type":"urltest","tag":"proxy","outbounds":["naive-a","naive-b","direct"]},
+            {"type":"direct","tag":"direct"}
+          ],
+          "route": {"final": "proxy", "rules": []}
+        }"#,
+        )
+        .unwrap();
+        let group = urltest_group(&cfg).expect("urltest final is the group");
+        assert_eq!(group.tag, "proxy");
+        // Concrete members only, in group order — `direct` carries no server.
+        let members = group_members(&cfg, group);
+        assert_eq!(
+            members.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>(),
+            vec!["naive-a", "naive-b"]
+        );
+
+        // A non-group active outbound is not a urltest group.
+        let plain: SingBoxConfig = serde_json::from_str(
+            r#"{"outbounds":[{"type":"vless","tag":"proxy","server":"s"}],"route":{"final":"proxy"}}"#,
+        )
+        .unwrap();
+        assert!(urltest_group(&plain).is_none());
     }
 }

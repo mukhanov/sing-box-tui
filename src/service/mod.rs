@@ -6,6 +6,7 @@
 //! - `derive_health` — health badge derivation (data-model.md HealthStatus)
 //! - `CheckStatus` / `FailureReason` / `ConnectivityCheck` — US2 result model
 
+pub mod conns;
 pub mod probe;
 pub mod process;
 pub mod tunnel;
