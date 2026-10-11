@@ -412,19 +412,17 @@ impl App {
         }
     }
 
-    /// Terminal window title: colored state glyph + protocol + active
-    /// outbound + exit IP + throughput. Pure — unit-tested.
+    /// Terminal window title: colored state glyph + active outbound name +
+    /// exit IP + throughput. For a urltest group the name is the observed
+    /// member (the group itself is technical). Falls back to "sing-box"
+    /// without a config. Pure — unit-tested.
     pub fn title_text(&self) -> String {
-        let proto = self.protocol_label();
-        let mut title = format!("{} {}", self.state_glyph(), proto);
-        // The active outbound's tag (for a urltest group: the observed
-        // member — the group itself is technical). Skipped when the tag
-        // adds nothing (e.g. `direct`).
-        if let Some(tag) = &self.service.active_outbound
-            && tag != &proto
-        {
-            title.push_str(&format!(" → {tag}"));
-        }
+        let subject = self
+            .service
+            .active_outbound
+            .clone()
+            .unwrap_or_else(|| "sing-box".to_string());
+        let mut title = format!("{} {}", self.state_glyph(), subject);
         if let Some(ip) = &self.vpn_ip
             && self.service.state == LifecycleState::Running
         {
@@ -453,24 +451,6 @@ impl App {
                 _ => "🟢",
             },
         }
-    }
-
-    /// The active outbound's protocol (vless, vmess, trojan, wireguard,
-    /// direct…) — the title's subject. For a urltest group this is the
-    /// observed member's protocol. Falls back to "sing-box" when the config
-    /// is unavailable.
-    pub fn protocol_label(&self) -> String {
-        if let Some(cfg) = &self.config
-            && let Some(out) = self
-                .service
-                .active_outbound
-                .as_deref()
-                .and_then(|tag| cfg.outbounds.iter().find(|o| o.tag == tag))
-                .or_else(|| config::active_outbound(cfg))
-        {
-            return out.ty.clone();
-        }
-        "sing-box".to_string()
     }
 
     /// Check lookup by target for live updates.
@@ -1555,8 +1535,8 @@ mod tests {
         assert_eq!(app.state_glyph(), "🔴");
     }
 
-    /// The title names the active outbound's protocol and tag, falling back
-    /// to "sing-box" only without a config.
+    /// The title names the active outbound's tag, falling back to
+    /// "sing-box" only without a config.
     #[test]
     fn title_uses_protocol_of_active_outbound() {
         let mut app = App::new(true, PathBuf::from("/tmp/config.json"));
@@ -1572,11 +1552,11 @@ mod tests {
         app.service.state = LifecycleState::Running;
         app.recompute();
         // No tunnel in this fixture → Degraded; force healthy to assert the
-        // protocol part deterministically.
+        // subject deterministically.
         app.service.health = crate::service::HealthStatus::Healthy;
-        assert_eq!(app.title_text(), "🟢 vless → proxy", "{}", app.title_text());
+        assert_eq!(app.title_text(), "🟢 proxy", "{}", app.title_text());
 
-        // A direct-final profile names direct (tag adds nothing — no arrow).
+        // A direct-final profile names direct.
         app.config = Some(
             serde_json::from_str(
                 r#"{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}"#,
@@ -1614,7 +1594,7 @@ mod tests {
         app.recompute();
         app.service.health = crate::service::HealthStatus::Healthy;
         assert!(
-            app.title_text().starts_with("🟢 naive → naive-a"),
+            app.title_text().starts_with("🟢 naive-a"),
             "{}",
             app.title_text()
         );
@@ -1624,7 +1604,7 @@ mod tests {
         app.recompute();
         app.service.health = crate::service::HealthStatus::Healthy;
         assert!(
-            app.title_text().starts_with("🟢 naive → naive-b"),
+            app.title_text().starts_with("🟢 naive-b"),
             "{}",
             app.title_text()
         );
@@ -1634,7 +1614,7 @@ mod tests {
         app.recompute();
         app.service.health = crate::service::HealthStatus::Healthy;
         assert!(
-            app.title_text().starts_with("🟢 naive → naive-a"),
+            app.title_text().starts_with("🟢 naive-a"),
             "{}",
             app.title_text()
         );

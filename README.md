@@ -22,12 +22,12 @@ sudo sing-box-tui -c ~/.config/sing-box/config-ya.json
 Launch-time elevation only: the app never prompts for a password. When
 launched elevated with the service down, the service **starts
 automatically** (validated first). The **terminal window title** shows a
-colored state glyph, the active protocol and outbound, live throughput, and
-the resulting public IP (api.ipify.org through the tunnel, refreshed every
-60 s): `🟢 vless → proxy · 195.201.136.249 · ↓1.3 MB/s ↑651 KB/s` /
-`🔴 vless`. A urltest final is treated as technical: the title and the
-status panel name the member actually carrying traffic, resolved live from
-the sing-box process's established connections (no management API needed).
+colored state glyph, the active outbound's name, live throughput, and the
+resulting public IP (api.ipify.org through the tunnel, refreshed every 60
+s): `🟢 proxy · 195.201.136.249 · ↓1.3 MB/s ↑651 KB/s` / `🔴 proxy`. A
+urltest final is treated as technical: the title and the status panel name
+the member actually carrying traffic, resolved live from the sing-box
+process's established connections (no management API needed).
 All status is derived from observable state — the `sing-box` process
 (`pgrep`/`ps`), the tunnel interface (`ifconfig`), the read-only config file,
 and on-demand connectivity tests — because the management API is not enabled
